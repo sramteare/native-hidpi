@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+"""Check that a GNOME Wayland session drives a monitor at its native resolution,
+and switch to native mode with an integer framebuffer scale.
+
+The common failure this addresses: a 4K panel fed a 1440p signal. The monitor's
+own scaler upsamples every pixel by a non-integer factor, so the whole desktop
+looks soft. No font, fontconfig or antialiasing setting can recover that, but
+nothing reports it either - the resolution just "looks a bit blurry".
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+try:
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+except ImportError:
+    sys.exit("python3-gi is required:  sudo apt install python3-gi")
+
+DEST = "org.gnome.Mutter.DisplayConfig"
+PATH = "/org/gnome/Mutter/DisplayConfig"
+IFACE = "org.gnome.Mutter.DisplayConfig"
+STATE_SIG = "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
+APPLY_SIG = "(uua(iiduba(ssa{sv}))a{sv})"
+
+METHOD_VERIFY = 1
+METHOD_PERSIST = 2
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "native-hidpi"
+)
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+FONTCONF = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "fontconfig",
+    "fonts.conf",
+)
+FONTCONF_BACKUP = FONTCONF + ".native-hidpi.bak"
+
+UI_FONT_KEYS = [
+    "font-name",
+    "monospace-font-name",
+    "document-font-name",
+    "font-antialiasing",
+    "font-hinting",
+    "font-rendering",
+    "text-scaling-factor",
+]
+
+# antialiasing, hintstyle, gnome-antialiasing, gnome-hinting
+PROFILES = {
+    "mac": ("none", "hintslight", "grayscale", "slight"),
+    "sharp": ("none", "hintfull", "grayscale", "full"),
+    "subpixel": ("rgb", "hintslight", "rgba", "slight"),
+}
+
+
+def bus_call(method, inb=None, outt=None):
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return bus.call_sync(
+        DEST, PATH, IFACE, method, inb,
+        GLib.VariantType.new(outt) if outt else None,
+        Gio.DBusCallFlags.NONE, -1, None,
+    )
+
+
+def have_display_config():
+    try:
+        bus_call("GetCurrentState", None, STATE_SIG)
+        return True
+    except GLib.Error:
+        return False
+
+
+def session_type():
+    return os.environ.get("XDG_SESSION_TYPE", "unknown")
+
+
+def read_state():
+    serial, monitors, logical, props = bus_call("GetCurrentState", None, STATE_SIG)
+    out = []
+    for lm in logical:
+        x, y, scale, transform, primary, members, _ = lm
+        connector = members[0][0]
+        native = current = None
+        scales = []
+        for mon in monitors:
+            if mon[0][0] != connector:
+                continue
+            for mode in mon[1]:
+                mode_id, w, h, rate, _max, supported, mode_props = mode
+                if "is-current" in mode_props:
+                    current = (mode_id, w, h, rate)
+                    scales = list(supported)
+                if "is-preferred" in mode_props:
+                    native = (mode_id, w, h, rate)
+        out.append(
+            {
+                "connector": connector,
+                "x": x,
+                "y": y,
+                "scale": scale,
+                "transform": transform,
+                "primary": primary,
+                "current": current,
+                "native": native,
+                "scales": scales,
+            }
+        )
+    return int(serial), out
+
+
+def best_integer_scale(native, want_logical_width=1920):
+    """Largest integer scale whose logical width still fits the wanted desktop."""
+    if native is None:
+        return 1.0
+    integers = [s for s in [1, 2, 3, 4] if native[1] // s >= want_logical_width]
+    return float(max(integers)) if integers else 1.0
+
+
+def apply_config(monitor, mode_id, scale, method):
+    serial, states = read_state()
+    me = next(m for m in states if m["connector"] == monitor["connector"])
+    lm = [
+        (
+            me["x"],
+            me["y"],
+            float(scale),
+            me["transform"],
+            me["primary"],
+            [(me["connector"], mode_id, {})],
+        )
+    ]
+    args = GLib.Variant(APPLY_SIG, (serial, method, lm, {}))
+    bus_call("ApplyMonitorsConfig", args)
+
+
+def gsettings_get(key):
+    if not shutil.which("gsettings"):
+        return None
+    r = subprocess.run(
+        ["gsettings", "get", "org.gnome.desktop.interface", key],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def gsettings_set(key, value, quoted=True):
+    if not shutil.which("gsettings"):
+        return
+    subprocess.run(
+        ["gsettings", "set", "org.gnome.desktop.interface", key, value if quoted else str(value)],
+        capture_output=True,
+    )
+
+
+def fontconf_body(rgba, hintstyle):
+    return f"""<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<!-- written by native-hidpi -->
+<fontconfig>
+  <match target="font">
+    <edit name="antialias" mode="assign"><bool>true</bool></edit>
+    <edit name="rgba" mode="assign"><const>{rgba}</const></edit>
+    <edit name="hinting" mode="assign"><bool>true</bool></edit>
+    <edit name="hintstyle" mode="assign"><const>{hintstyle}</const></edit>
+    <edit name="hintauto" mode="assign"><bool>false</bool></edit>
+    <edit name="embeddedbitmap" mode="assign"><bool>false</bool></edit>
+  </match>
+</fontconfig>
+"""
+
+
+def save_state(data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE_FILE, "w") as fh:
+        json.dump(data, fh, indent=2)
+
+
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {}
+    with open(STATE_FILE) as fh:
+        return json.load(fh)
+
+
+def find_problems(states):
+    """Non-native resolution on a panel, i.e. the monitor's scaler is in the path."""
+    msgs = []
+    for m in states:
+        cur, native = m["current"], m["native"]
+        if cur and native and cur[1:] != native[1:]:
+            ratio = native[1] / cur[1]
+            msgs.append(
+                f"{m['connector']}: {cur[1]}x{cur[2]} signal on a "
+                f"{native[1]}x{native[2]} panel, monitor upscales x{ratio:.2f}"
+            )
+    return msgs
+
+
+def find_notes(states):
+    msgs = []
+    for m in states:
+        if not float(m["scale"]).is_integer():
+            msgs.append(
+                f"{m['connector']}: fractional scale {m['scale']} - XWayland and Electron "
+                "windows render at the next integer scale and get resampled, and apps that "
+                "ignore fractional scaling end up a different size than their neighbours"
+            )
+    return msgs
+
+
+def report(states):
+    for m in states:
+        cur, native = m["current"], m["native"]
+        print(f"\n{m['connector']}  scale {m['scale']}  primary={m['primary']}")
+        if cur is None:
+            print("  no current mode reported")
+            continue
+        print(f"  active : {cur[0]}")
+        print(f"  native : {native[0] if native else 'unknown'}")
+        print(f"  scales supported on the active mode: "
+              f"{', '.join(str(s) for s in m['scales']) if m['scales'] else 'unknown'}")
+    problems = find_problems(states)
+    for p in problems:
+        print("\nWARNING  " + p +
+              ". Everything on screen is soft and no font setting will fix it.")
+    for n in find_notes(states):
+        print("\nNOTE     " + n)
+    return len(problems)
+
+
+def cmd_status(_args):
+    if not have_display_config():
+        sys.exit(
+            f"org.gnome.Mutter.DisplayConfig is not available "
+            f"(session type: {session_type()}). This tool needs a GNOME Wayland session."
+        )
+    _serial, states = read_state()
+    problems = report(states)
+    font = gsettings_get("font-name")
+    aa = gsettings_get("font-antialiasing")
+    hint = gsettings_get("font-hinting")
+    if font is not None:
+        scale = states[0]["scale"] if states else 1.0
+        try:
+            pt = float(font.strip("'").rsplit(" ", 1)[1])
+            px_em = pt / 72 * 96 * scale
+            print(f"\nUI font  {font.strip()}  -> {px_em:.1f} device px per em at scale {scale}")
+        except (ValueError, IndexError):
+            pass
+        print(f"antialiasing {aa}   hinting {hint}")
+    print("\n" + ("no non-native resolution detected" if problems == 0 else
+                  f"{problems} monitor(s) not running at native resolution"))
+    return 0 if problems == 0 else 1
+
+
+def cmd_fix(args):
+    if not have_display_config():
+        sys.exit(
+            f"org.gnome.Mutter.DisplayConfig is not available "
+            f"(session type: {session_type()}). This tool needs a GNOME Wayland session."
+        )
+    _serial, states = read_state()
+    prev = load_state()
+    wanted = None
+
+    for m in states:
+        if m["current"] is None or m["native"] is None:
+            continue
+        scale = args.scale or best_integer_scale(m["native"], args.want_logical_width)
+        if m["current"][1:] != m["native"][1:] or m["scale"] != scale:
+            wanted = (m, m["native"][0], scale)
+            break
+
+    if wanted is None:
+        print("already at native resolution with the chosen scale")
+    elif args.dry_run:
+        m, mode_id, scale = wanted
+        print(f"would apply {m['connector']}: {m['current'][0]} scale {m['scale']} "
+              f"-> {mode_id} scale {scale}")
+    else:
+        m, mode_id, scale = wanted
+        if "display" not in prev:
+            prev["display"] = [
+                {"connector": s["connector"], "mode": s["current"][0], "scale": s["scale"]}
+                for s in states
+                if s["current"]
+            ]
+            save_state(prev)
+        apply_config(m, mode_id, scale, METHOD_VERIFY)
+        print(f"verified {mode_id} scale {scale} on {m['connector']}")
+        apply_config(m, mode_id, scale, METHOD_PERSIST)
+        print(f"applied {mode_id} scale {scale} on {m['connector']} (persistent)")
+
+    if not args.no_fonts:
+        rgba, hintstyle, gnome_aa, gnome_hint = PROFILES[args.profile]
+        if args.dry_run:
+            print(f"would write {FONTCONF} (rgba={rgba}, hintstyle={hintstyle})")
+            return 0
+        if "interface" not in prev:
+            prev["interface"] = {k: gsettings_get(k) for k in UI_FONT_KEYS}
+        if os.path.exists(FONTCONF) and "fontconf" not in prev:
+            with open(FONTCONF) as fh:
+                prev["fontconf"] = fh.read()
+            shutil.copy2(FONTCONF, FONTCONF_BACKUP)
+        save_state(prev)
+
+        os.makedirs(os.path.dirname(FONTCONF), exist_ok=True)
+        with open(FONTCONF, "w") as fh:
+            fh.write(fontconf_body(rgba, hintstyle))
+        gsettings_set("font-rendering", "manual")
+        gsettings_set("font-antialiasing", gnome_aa)
+        gsettings_set("font-hinting", gnome_hint)
+        print(f"wrote {FONTCONF} and set antialiasing={gnome_aa}, hinting={gnome_hint}")
+        print("profiles: mac (grayscale+slight), sharp (grayscale+full), "
+              "subpixel (rgb+slight)")
+        print("restart browsers - they read fontconfig once at startup")
+    return 0
+
+
+def cmd_revert(_args):
+    prev = load_state()
+    if not prev:
+        print("nothing recorded in " + STATE_FILE)
+        return 1
+    if have_display_config() and prev.get("display"):
+        _serial, states = read_state()
+        for saved in prev["display"]:
+            me = next((s for s in states if s["connector"] == saved["connector"]), None)
+            if me is None:
+                continue
+            try:
+                apply_config(me, saved["mode"], saved["scale"], METHOD_PERSIST)
+                print(f"restored {saved['connector']}: {saved['mode']} scale {saved['scale']}")
+            except GLib.Error as exc:
+                print(f"could not restore {saved['connector']}: {exc.message}")
+    for key, value in (prev.get("interface") or {}).items():
+        if value is None:
+            subprocess.run(
+                ["gsettings", "reset", "org.gnome.desktop.interface", key], capture_output=True
+            )
+        else:
+            gsettings_set(key, value.strip("'"))
+    if prev.get("fontconf") is not None:
+        with open(FONTCONF, "w") as fh:
+            fh.write(prev["fontconf"])
+        print(f"restored {FONTCONF}")
+    elif os.path.exists(FONTCONF):
+        os.remove(FONTCONF)
+        print(f"removed {FONTCONF}")
+    os.remove(STATE_FILE)
+    print("reverted; restart browsers")
+    return 0
+
+
+def cmd_selftest(_args):
+    """Exercise the detection logic without touching the display."""
+    fake = [
+        {  # the bug this tool exists for: 1440p signal on a 4K panel
+            "connector": "DP-1", "x": 0, "y": 0, "scale": 1.0, "transform": 0,
+            "primary": True,
+            "current": ("2560x1440@59.951", 2560, 1440, 59.951),
+            "native": ("3840x2160@59.997", 3840, 2160, 59.997),
+            "scales": [1.0, 1.25, 1.5, 2.0],
+        },
+        {  # correct: native mode, integer scale
+            "connector": "DP-2", "x": 0, "y": 0, "scale": 2.0, "transform": 0,
+            "primary": False,
+            "current": ("3840x2160@59.997", 3840, 2160, 59.997),
+            "native": ("3840x2160@59.997", 3840, 2160, 59.997),
+            "scales": [1.0, 2.0],
+        },
+    ]
+    checks = [
+        ("detects upscaled signal", len(find_problems(fake)) == 1),
+        ("names the right connector", find_problems(fake)[0].startswith("DP-1")),
+        ("leaves native+2x alone", find_problems(fake[1:]) == []),
+        ("flags fractional scale", len(find_notes(fake[:1])) == 0
+         and len(find_notes([dict(fake[1], scale=1.5)])) == 1),
+        ("picks 2x on 4K", best_integer_scale(fake[0]["native"], 1920) == 2.0),
+        ("picks 1x on 1440p panel", best_integer_scale((None, 2560, 1440, 60), 1920) == 1.0),
+        ("honours wanted logical width",
+         best_integer_scale(fake[0]["native"], 2560) == 1.0),
+    ]
+    failed = 0
+    for name, ok in checks:
+        print(f"  {'ok  ' if ok else 'FAIL'}  {name}")
+        failed += 0 if ok else 1
+    print("\nreport for the synthetic 1440p-on-4K case:")
+    report(fake[:1])
+    print()
+    return 1 if failed else 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="report active vs native mode and scale")
+
+    f = sub.add_parser("fix", help="switch to native mode with an integer scale")
+    f.add_argument("--scale", type=float, help="force a framebuffer scale (e.g. 2)")
+    f.add_argument("--want-logical-width", type=int, default=1920,
+                   help="logical desktop width to aim for when picking an integer scale")
+    f.add_argument("--profile", choices=sorted(PROFILES), default="mac",
+                   help="antialiasing profile to install (default: mac)")
+    f.add_argument("--no-fonts", action="store_true", help="only touch the display config")
+    f.add_argument("--dry-run", action="store_true", help="print what would happen")
+
+    sub.add_parser("revert", help="restore the previous mode, scale, gsettings and fonts.conf")
+
+    sub.add_parser("selftest", help="check the detection logic without touching the display")
+
+    args = p.parse_args()
+    return {"status": cmd_status, "fix": cmd_fix, "revert": cmd_revert,
+            "selftest": cmd_selftest}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -68,6 +68,16 @@ Fractional scale has a second cost that is easy to miss: Mutter keeps `Xft.dpi` 
 resampled down, and apps that ignore fractional scaling end up a different size from
 their neighbours. `status` prints a note when it sees this.
 
+And Chrome specifically: the Chrome 157 binary on this machine binds `wp_viewport` but
+contains **no** `zwp_fractional_scale` symbols, i.e. it does not implement
+`fractional-scale-v1`. Even as a native Wayland client it renders at the next integer
+scale and the compositor resamples it, so fractional scaling never looks right in Chrome.
+Check your own build:
+
+```bash
+strings -a /opt/google/chrome/chrome | grep -oE "zwp_fractional_scale[a-z_]*|wp_viewport" | sort -u
+```
+
 If 2x makes everything too big, shrink the contents rather than the pixel grid:
 
 ```
@@ -94,6 +104,22 @@ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
 --dry-run                 print what would change
 selftest                  exercise the detection logic, no display changes
 ```
+
+## Safety
+
+- The new mode is applied with `METHOD_VERIFY` first, and only persisted if verification
+  passes.
+- The previous mode, scale, GSettings values and `fonts.conf` are recorded before any
+  change, and `revert` restores them.
+- `fonts.conf` is parsed before it is written, then fontconfig is asked to load it; if it
+  rejects the file, the backup is restored and the tool exits. fontconfig drops the
+  **entire** file on a single syntax error and every client silently falls back to distro
+  defaults, so a malformed edit is invisible otherwise.
+- `status` reports a malformed `fonts.conf` as a warning and exits non-zero.
+- Refuses to run when Mutter reports no outputs (headless or monitor powered off) instead
+  of claiming everything is fine.
+- No root. Nothing outside `monitors.xml` (owned by GNOME), GSettings and
+  `~/.config/fontconfig/fonts.conf`.
 
 ## Requirements and limits
 

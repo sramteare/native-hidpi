@@ -176,6 +176,36 @@ def fontconf_body(rgba, hintstyle):
 """
 
 
+def fontconf_ok(path):
+    """fontconfig silently drops the *whole* file on any parse error, and every
+    fontconfig client (Chrome, Blender, Java) then falls back to distro defaults.
+    Verify the written file actually loads."""
+    if not shutil.which("fc-match"):
+        return True, ""
+    err = subprocess.run(["fc-match", "sans-serif"], capture_output=True, text=True).stderr.strip()
+    return (path not in err) and ("Fontconfig error" not in err), err
+
+
+def write_fontconf(rgba, hintstyle):
+    import xml.etree.ElementTree as ET
+    body = fontconf_body(rgba, hintstyle)
+    try:
+        ET.fromstring(body)
+    except ET.ParseError as exc:
+        sys.exit(f"refusing to write malformed fonts.conf: {exc}")
+    os.makedirs(os.path.dirname(FONTCONF), exist_ok=True)
+    with open(FONTCONF, "w") as fh:
+        fh.write(body)
+    ok, err = fontconf_ok(FONTCONF)
+    if not ok:
+        if os.path.exists(FONTCONF_BACKUP):
+            shutil.copy2(FONTCONF_BACKUP, FONTCONF)
+        else:
+            os.remove(FONTCONF)
+        sys.exit(f"fontconfig rejected {FONTCONF}; previous file restored.\n{err}")
+    return ok
+
+
 def save_state(data):
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(STATE_FILE, "w") as fh:
@@ -242,6 +272,11 @@ def cmd_status(_args):
             f"(session type: {session_type()}). This tool needs a GNOME Wayland session."
         )
     _serial, states = read_state()
+    if not states:
+        sys.exit(
+            "no logical monitors reported by Mutter - no display connected, or the "
+            "session is headless. Re-run with a monitor attached."
+        )
     problems = report(states)
     font = gsettings_get("font-name")
     aa = gsettings_get("font-antialiasing")
@@ -255,9 +290,19 @@ def cmd_status(_args):
         except (ValueError, IndexError):
             pass
         print(f"antialiasing {aa}   hinting {hint}")
+    broken = 0
+    if os.path.exists(FONTCONF):
+        ok, err = fontconf_ok(FONTCONF)
+        if ok:
+            print(f"\nuser fontconfig: {FONTCONF} loads ok")
+        else:
+            broken = 1
+            print(f"\nWARNING  {FONTCONF} is malformed, so fontconfig has dropped it entirely: "
+                  "Chrome, Blender and Java are silently back on distro defaults.")
+            print(f"  {err}")
     print("\n" + ("no non-native resolution detected" if problems == 0 else
                   f"{problems} monitor(s) not running at native resolution"))
-    return 0 if problems == 0 else 1
+    return 0 if (problems == 0 and broken == 0) else 1
 
 
 def cmd_fix(args):
@@ -267,8 +312,14 @@ def cmd_fix(args):
             f"(session type: {session_type()}). This tool needs a GNOME Wayland session."
         )
     _serial, states = read_state()
+    if not states:
+        sys.exit(
+            "no logical monitors reported by Mutter - no display connected, or the "
+            "session is headless. Re-run with a monitor attached."
+        )
     prev = load_state()
     wanted = None
+    skipped = [m["connector"] for m in states if m["native"] is None]
 
     for m in states:
         if m["current"] is None or m["native"] is None:
@@ -280,6 +331,8 @@ def cmd_fix(args):
 
     if wanted is None:
         print("already at native resolution with the chosen scale")
+        if skipped:
+            print(f"  (no native mode reported for: {', '.join(skipped)} - left alone)")
     elif args.dry_run:
         m, mode_id, scale = wanted
         print(f"would apply {m['connector']}: {m['current'][0]} scale {m['scale']} "
@@ -311,9 +364,7 @@ def cmd_fix(args):
             shutil.copy2(FONTCONF, FONTCONF_BACKUP)
         save_state(prev)
 
-        os.makedirs(os.path.dirname(FONTCONF), exist_ok=True)
-        with open(FONTCONF, "w") as fh:
-            fh.write(fontconf_body(rgba, hintstyle))
+        write_fontconf(rgba, hintstyle)
         gsettings_set("font-rendering", "manual")
         gsettings_set("font-antialiasing", gnome_aa)
         gsettings_set("font-hinting", gnome_hint)
@@ -387,6 +438,8 @@ def cmd_selftest(_args):
         ("picks 1x on 1440p panel", best_integer_scale((None, 2560, 1440, 60), 1920) == 1.0),
         ("honours wanted logical width",
          best_integer_scale(fake[0]["native"], 2560) == 1.0),
+        ("user fonts.conf parses (if present)",
+         (not os.path.exists(FONTCONF)) or fontconf_ok(FONTCONF)[0]),
     ]
     failed = 0
     for name, ok in checks:

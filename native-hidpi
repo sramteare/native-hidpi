@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Check that a GNOME Wayland session drives a monitor at its native resolution,
-and switch to native mode with an integer framebuffer scale.
+"""Check that a GNOME session drives a monitor at its native resolution, and switch
+to native mode with an integer framebuffer scale.
 
-The common failure this addresses: a 4K panel fed a 1440p signal. The monitor's
-own scaler upsamples every pixel by a non-integer factor, so the whole desktop
-looks soft. No font, fontconfig or antialiasing setting can recover that, but
-nothing reports it either - the resolution just "looks a bit blurry".
+The common failure this addresses: a 4K panel fed a 1440p signal. The monitor's own
+scaler upsamples every pixel by a non-integer factor, so the whole desktop looks soft.
+No font, fontconfig or antialiasing setting can recover that, and nothing reports it -
+the resolution just "looks a bit blurry".
 """
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -28,8 +29,15 @@ IFACE = "org.gnome.Mutter.DisplayConfig"
 STATE_SIG = "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
 APPLY_SIG = "(uua(iiduba(ssa{sv}))a{sv})"
 
-METHOD_VERIFY = 1
+# Mutter's method flags are documented inconsistently across versions (verify/persist
+# as bitflags in some, verify/temporary/persistent in others), so this tool applies
+# exactly one configuration and checks the result by reading it back, rather than
+# trusting a separate verify step.
 METHOD_PERSIST = 2
+
+# Mutter reports and accepts scales as float32: 5/3 comes back as 1.6666666269302368, so
+# two scales that mean the same thing never compare exactly.
+SCALE_TOL = 1e-5
 
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "native-hidpi"
@@ -52,7 +60,7 @@ UI_FONT_KEYS = [
     "text-scaling-factor",
 ]
 
-# antialiasing, hintstyle, gnome-antialiasing, gnome-hinting
+# fontconfig rgba/hintstyle, gnome antialiasing/hinting
 PROFILES = {
     "mac": ("none", "hintslight", "grayscale", "slight"),
     "sharp": ("none", "hintfull", "grayscale", "full"),
@@ -82,16 +90,21 @@ def session_type():
 
 
 def read_state():
-    serial, monitors, logical, props = bus_call("GetCurrentState", None, STATE_SIG)
+    """(serial, logical_monitors). A logical monitor may mirror several connectors."""
+    serial, monitors, logical, _props = bus_call("GetCurrentState", None, STATE_SIG)
     out = []
     for lm in logical:
         x, y, scale, transform, primary, members, _ = lm
-        connector = members[0][0]
+        connectors = [m[0] for m in members]
+        specs = [(m[0], m[3]) for m in members]
         native = current = None
         scales = []
+        native_scales = []
+        builtin = False
         for mon in monitors:
-            if mon[0][0] != connector:
+            if mon[0][0] not in connectors:
                 continue
+            builtin = builtin or bool(mon[2].get("is-builtin", False))
             for mode in mon[1]:
                 mode_id, w, h, rate, _max, supported, mode_props = mode
                 if "is-current" in mode_props:
@@ -99,45 +112,176 @@ def read_state():
                     scales = list(supported)
                 if "is-preferred" in mode_props:
                     native = (mode_id, w, h, rate)
+                    native_scales = list(supported)
         out.append(
             {
-                "connector": connector,
+                "connectors": connectors,
+                "specs": specs,
+                "identity": tuple(sorted(specs)),
                 "x": x,
                 "y": y,
-                "scale": scale,
+                "scale": float(scale),
                 "transform": transform,
                 "primary": primary,
                 "current": current,
                 "native": native,
                 "scales": scales,
+                "native_scales": native_scales,
+                "builtin": builtin,
             }
         )
     return int(serial), out
 
 
-def best_integer_scale(native, want_logical_width=1920):
-    """Largest integer scale whose logical width still fits the wanted desktop."""
+def best_integer_scale(native, scales, want_logical_width=1920):
+    """Largest integer scale that the mode actually offers and whose logical width
+    still fits the wanted desktop. Falls back to the largest supported scale."""
     if native is None:
         return 1.0
-    integers = [s for s in [1, 2, 3, 4] if native[1] // s >= want_logical_width]
-    return float(max(integers)) if integers else 1.0
+    offered = [float(s) for s in scales]
+    candidates = []
+    for s in (4, 3, 2, 1):
+        if native[1] // s < want_logical_width:
+            continue
+        if not offered or float(s) in offered:
+            candidates.append(float(s))
+    if candidates:
+        return max(candidates)
+    return max(offered) if offered else 1.0
 
 
-def apply_config(monitor, mode_id, scale, method):
-    serial, states = read_state()
-    me = next(m for m in states if m["connector"] == monitor["connector"])
-    lm = [
-        (
-            me["x"],
-            me["y"],
-            float(scale),
-            me["transform"],
-            me["primary"],
-            [(me["connector"], mode_id, {})],
+def scale_matches(s, wanted):
+    """True when `wanted` is how a person writes the float32 step `s`. Mutter's repeating
+    thirds come back as 1.6666666269302368 or 2.6666667461395264, and people type 1.6,
+    1.66 or 1.67 for them, so either rounding or truncation at one or two decimals counts."""
+    return (round(s, 1) == wanted or math.floor(s * 10) / 10 == wanted
+            or round(s, 2) == wanted or math.floor(s * 100) / 100 == wanted)
+
+
+def resolve_scale(forced_scale, scales):
+    """Snap --scale onto a scale the mode really offers. This only ever picks a real
+    framebuffer scale: text-scaling-factor is not a display scale (it resizes GNOME/GTK
+    text, not windows, not Chrome or Electron, not the layout grid), so an unsupported
+    request is refused rather than faked. Mutter accepts a scale only when it divides the
+    mode into whole pixels, and rejects everything else with InvalidArgs."""
+    if forced_scale is None:
+        return None
+    wanted = float(forced_scale)
+    offered = [float(s) for s in scales or []]
+    if not offered:
+        return wanted
+    matches = [s for s in offered if abs(s - wanted) <= 0.02 or scale_matches(s, wanted)]
+    if matches:
+        return float(min(matches, key=lambda s: abs(s - wanted)))
+    closest = min(offered, key=lambda s: abs(s - wanted))
+    raise ValueError(
+        f"scale {wanted} is not a framebuffer scale this mode offers: Mutter only accepts "
+        f"scales that divide the mode into whole pixels (3840/1.8 = 2133.33 is one such "
+        f"rejection) and answers InvalidArgs to the rest. Closest available: {closest}; "
+        f"supported: {', '.join(str(s) for s in offered)}. It is not faked with "
+        f"text-scaling-factor, which only resizes GNOME text and leaves windows, Chrome and "
+        f"Electron at the old scale - pass --text-scale yourself if that is what you want.")
+
+
+def build_apply_list(states, changes):
+    """The logical_monitors array is the complete desired configuration: anything left
+    out is disabled. Always send every output, changing only what was asked for."""
+    lm = []
+    for i, s in enumerate(states):
+        mode_id, scale = changes.get(i, (s["current"][0] if s["current"] else None, s["scale"]))
+        if mode_id is None:
+            raise RuntimeError(f"{s['connectors']}: no current mode, refusing to apply")
+        lm.append((s["x"], s["y"], float(scale), s["transform"], s["primary"],
+                   [(conn, mode_id, {}) for conn in s["connectors"]]))
+    return lm
+
+
+def apply_changes(states, changes, dry=False):
+    if dry:
+        return
+    serial, fresh = read_state()
+    if len(fresh) != len(states):
+        raise RuntimeError(
+            f"output count changed between reading and applying "
+            f"({len(states)} -> {len(fresh)}); nothing applied, re-run"
         )
-    ]
-    args = GLib.Variant(APPLY_SIG, (serial, method, lm, {}))
+    for i, s in enumerate(fresh):
+        if sorted(s["connectors"]) != sorted(states[i]["connectors"]):
+            raise RuntimeError("output set changed (hotplug?); nothing applied, re-run")
+    args = GLib.Variant(APPLY_SIG, (serial, METHOD_PERSIST, build_apply_list(fresh, changes), {}))
     bus_call("ApplyMonitorsConfig", args)
+
+
+def verify_applied(changes, retries=1):
+    """Read the configuration back. This, not a verify flag, is the safety net."""
+    for _ in range(retries + 1):
+        _serial, states = read_state()
+        bad = []
+        for i, (mode_id, scale) in changes.items():
+            if i >= len(states):
+                bad.append(f"output {i} missing")
+                continue
+            s = states[i]
+            if s["current"] is None or s["current"][0] != mode_id or \
+                    abs(s["scale"] - scale) > SCALE_TOL:
+                got = s["current"][0] if s["current"] else "none"
+                bad.append(f"{','.join(s['connectors'])}: wanted {mode_id} scale {scale}, got {got} scale {s['scale']}")
+        if not bad:
+            return True, []
+    return False, bad
+
+
+def resolution_problem(cur, native):
+    return bool(cur and native and (cur[1], cur[2]) != (native[1], native[2]))
+
+
+def find_problems(states):
+    """Non-native resolution on a panel, i.e. the monitor's scaler is in the path."""
+    msgs = []
+    for m in states:
+        cur, native = m["current"], m["native"]
+        if resolution_problem(cur, native):
+            ratio = native[1] / cur[1]
+            msgs.append(
+                f"{','.join(m['connectors'])}: {cur[1]}x{cur[2]} signal on a "
+                f"{native[1]}x{native[2]} panel, monitor upscales x{ratio:.2f}"
+                + (" (built-in panel)" if m.get("builtin") else "")
+            )
+    return msgs
+
+
+def find_notes(states):
+    msgs = []
+    for m in states:
+        if not float(m["scale"]).is_integer():
+            msgs.append(
+                f"{','.join(m['connectors'])}: fractional scale {m['scale']} - clients that "
+                "do not implement fractional-scale-v1 render at the next integer scale and "
+                "get resampled, and apps that ignore scaling end up a different size than "
+                "their neighbours"
+            )
+    return msgs
+
+
+def report(states):
+    for m in states:
+        cur, native = m["current"], m["native"]
+        label = ",".join(m["connectors"]) + (" [built-in]" if m["builtin"] else "")
+        print(f"\n{label}  scale {m['scale']}  primary={m['primary']}")
+        if cur is None:
+            print("  no current mode reported")
+            continue
+        print(f"  active : {cur[0]}")
+        print(f"  native : {native[0] if native else 'unknown'}")
+        print(f"  scales supported on the active mode: "
+              f"{', '.join(str(s) for s in m['scales']) if m['scales'] else 'unknown'}")
+    problems = find_problems(states)
+    for p in problems:
+        print("\nWARNING  " + p +
+              ". Everything on screen is soft and no font setting will fix it.")
+    for n in find_notes(states):
+        print("\nNOTE     " + n)
+    return len(problems)
 
 
 def gsettings_get(key):
@@ -150,13 +294,23 @@ def gsettings_get(key):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def gsettings_set(key, value, quoted=True):
+def gsettings_op(op, key, value=None):
     if not shutil.which("gsettings"):
-        return
-    subprocess.run(
-        ["gsettings", "set", "org.gnome.desktop.interface", key, value if quoted else str(value)],
-        capture_output=True,
-    )
+        return False
+    argv = ["gsettings", op, "org.gnome.desktop.interface", key]
+    if op == "set":
+        argv.append(value)
+    return subprocess.run(argv, capture_output=True).returncode == 0
+
+
+def gsettings_float(key, default=1.0):
+    raw = gsettings_get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip().strip("'"))
+    except ValueError:
+        return default
 
 
 def fontconf_body(rgba, hintstyle):
@@ -177,13 +331,17 @@ def fontconf_body(rgba, hintstyle):
 
 
 def fontconf_ok(path):
-    """fontconfig silently drops the *whole* file on any parse error, and every
-    fontconfig client (Chrome, Blender, Java) then falls back to distro defaults.
-    Verify the written file actually loads."""
+    """fontconfig drops the *entire* file on a single parse error and every client
+    silently falls back to distro defaults. fontconfig always names the offending file
+    in its message, so only attribute errors that mention ours."""
     if not shutil.which("fc-match"):
         return True, ""
-    err = subprocess.run(["fc-match", "sans-serif"], capture_output=True, text=True).stderr.strip()
-    return (path not in err) and ("Fontconfig error" not in err), err
+    env = None
+    if os.path.abspath(path) != os.path.abspath(FONTCONF):
+        env = dict(os.environ, FONTCONFIG_FILE=path)
+    err = subprocess.run(["fc-match", "sans-serif"], capture_output=True,
+                         text=True, env=env).stderr
+    return (os.path.basename(path) not in err and path not in err), err.strip()
 
 
 def write_fontconf(rgba, hintstyle):
@@ -193,9 +351,16 @@ def write_fontconf(rgba, hintstyle):
         ET.fromstring(body)
     except ET.ParseError as exc:
         sys.exit(f"refusing to write malformed fonts.conf: {exc}")
-    os.makedirs(os.path.dirname(FONTCONF), exist_ok=True)
-    with open(FONTCONF, "w") as fh:
-        fh.write(body)
+    if os.path.exists(FONTCONF) and not os.path.exists(FONTCONF_BACKUP):
+        shutil.copy2(FONTCONF, FONTCONF_BACKUP)
+    try:
+        os.makedirs(os.path.dirname(FONTCONF), exist_ok=True)
+        tmp = FONTCONF + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(body)
+        os.replace(tmp, FONTCONF)
+    except OSError as exc:
+        sys.exit(f"cannot write {FONTCONF}: {exc}")
     ok, err = fontconf_ok(FONTCONF)
     if not ok:
         if os.path.exists(FONTCONF_BACKUP):
@@ -203,74 +368,269 @@ def write_fontconf(rgba, hintstyle):
         else:
             os.remove(FONTCONF)
         sys.exit(f"fontconfig rejected {FONTCONF}; previous file restored.\n{err}")
-    return ok
+    return True
 
 
 def save_state(data):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as fh:
-        json.dump(data, fh, indent=2)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except OSError as exc:
+        sys.exit(f"cannot record previous state in {STATE_FILE}: {exc} (nothing applied)")
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
-    with open(STATE_FILE) as fh:
-        return json.load(fh)
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"{STATE_FILE} is unreadable ({exc}); keeping it aside and starting fresh")
+        try:
+            os.replace(STATE_FILE, STATE_FILE + ".corrupt")
+        except OSError:
+            pass
+        return {}
 
 
-def find_problems(states):
-    """Non-native resolution on a panel, i.e. the monitor's scaler is in the path."""
-    msgs = []
-    for m in states:
-        cur, native = m["current"], m["native"]
-        if cur and native and cur[1:] != native[1:]:
-            ratio = native[1] / cur[1]
-            msgs.append(
-                f"{m['connector']}: {cur[1]}x{cur[2]} signal on a "
-                f"{native[1]}x{native[2]} panel, monitor upscales x{ratio:.2f}"
-            )
-    return msgs
+MONITORS_XML = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "monitors.xml"
+)
+MONITORS_XML_BACKUP = MONITORS_XML + ".native-hidpi.bak"
 
 
-def find_notes(states):
-    msgs = []
-    for m in states:
-        if not float(m["scale"]).is_integer():
-            msgs.append(
-                f"{m['connector']}: fractional scale {m['scale']} - XWayland and Electron "
-                "windows render at the next integer scale and get resampled, and apps that "
-                "ignore fractional scaling end up a different size than their neighbours"
-            )
-    return msgs
+def identity_of(s):
+    """(connector, serial) pairs of one logical monitor, mirrored ones included."""
+    return tuple(s.get("identity") or tuple(sorted((c, "") for c in s["connectors"])))
 
 
-def report(states):
-    for m in states:
-        cur, native = m["current"], m["native"]
-        print(f"\n{m['connector']}  scale {m['scale']}  primary={m['primary']}")
-        if cur is None:
-            print("  no current mode reported")
+def config_identity(states):
+    """A <configuration> block in monitors.xml is the *whole* set of connected monitors,
+    so a block is only comparable to the whole running set."""
+    return tuple(sorted(spec for s in states for spec in identity_of(s)))
+
+
+def mode_geometry(s, mode_id):
+    """(w, h, rate) of the mode we are about to store. Use the mode that is actually
+    being applied: an untouched output must keep its current mode, and with it its
+    refresh rate, instead of being rewritten with the native one."""
+    for src in (s.get("current"), s.get("native")):
+        if src and src[0] == mode_id:
+            return src[1], src[2], src[3]
+    fallback = s.get("native") or s.get("current")
+    return (fallback[1], fallback[2], fallback[3]) if fallback else (0, 0, 0.0)
+
+
+def format_scale(scale):
+    """Write the scale back exactly as Mutter reports it. Its fractional steps are float32
+    values (5/3 reads back as 1.6666666269302368), and a %.6g-style truncation to 1.66667
+    is a different scale that then looks like stored-vs-running drift forever."""
+    scale = float(scale)
+    return str(int(scale)) if scale.is_integer() else str(scale)
+
+
+def read_monitors_xml():
+    """Return the stored configurations as a list of dicts, or [] if there is no file.
+    Raises ValueError if the file cannot be parsed."""
+    if not os.path.exists(MONITORS_XML):
+        return []
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(MONITORS_XML).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise ValueError(f"{MONITORS_XML}: {exc}")
+    out = []
+    for cfg in root.findall("configuration"):
+        monitors = []
+        for lm in cfg.findall("logicalmonitor"):
+            scale_node = lm.find("scale")
+            try:
+                scale = float(scale_node.text) \
+                    if scale_node is not None and scale_node.text else 1.0
+            except (ET.ParseError, TypeError, ValueError) as exc:
+                raise ValueError(f"{MONITORS_XML}: unreadable <scale>: {exc}")
+            for mon in lm.findall("monitor"):
+                spec = mon.find("monitorspec")
+                mode = mon.find("mode")
+                if spec is None or mode is None:
+                    continue
+                try:
+                    entry = {
+                        "element": lm,
+                        "monitor_element": mon,
+                        "connector": spec.findtext("connector"),
+                        "product": spec.findtext("product"),
+                        "serial": spec.findtext("serial") or "",
+                        "mode": (int(mode.findtext("width")), int(mode.findtext("height")),
+                                 float(mode.findtext("rate"))),
+                        "scale": scale,
+                    }
+                except (ET.ParseError, TypeError, ValueError) as exc:
+                    raise ValueError(f"{MONITORS_XML}: unreadable <mode>: {exc}")
+                monitors.append(entry)
+        if monitors:
+            out.append({"element": cfg, "monitors": monitors})
+    return out
+
+
+def persist_monitors_xml(states, changes):
+    """Mutter's persistent apply does not reliably rewrite ~/.config/monitors.xml, and
+    whatever is in that file is what you get back after a hotplug or a login. So write
+    it ourselves: update the stored block that matches the current outputs, or append a
+    new one."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.parse(MONITORS_XML).getroot() if os.path.exists(MONITORS_XML) else \
+            ET.Element("monitors", {"version": "2"})
+    except ET.ParseError:
+        return f"{MONITORS_XML} is malformed; refusing to edit it"
+
+    if os.path.exists(MONITORS_XML) and not os.path.exists(MONITORS_XML_BACKUP):
+        try:
+            shutil.copy2(MONITORS_XML, MONITORS_XML_BACKUP)
+        except OSError as exc:
+            return f"could not back up {MONITORS_XML}: {exc}"
+
+    want = {}
+    for i, s in enumerate(states):
+        mode_id, scale = changes.get(i, (s["current"][0] if s["current"] else None, s["scale"]))
+        if mode_id is None:
             continue
-        print(f"  active : {cur[0]}")
-        print(f"  native : {native[0] if native else 'unknown'}")
-        print(f"  scales supported on the active mode: "
-              f"{', '.join(str(s) for s in m['scales']) if m['scales'] else 'unknown'}")
-    problems = find_problems(states)
-    for p in problems:
-        print("\nWARNING  " + p +
-              ". Everything on screen is soft and no font setting will fix it.")
-    for n in find_notes(states):
-        print("\nNOTE     " + n)
-    return len(problems)
+        w, h, rate = mode_geometry(s, mode_id)
+        want[identity_of(s)] = (w, h, rate, float(scale), s["primary"])
+
+    full = config_identity(states)
+
+    updated = 0
+    for cfg in root.findall("configuration"):
+        block_id = tuple(sorted(
+            (mon.findtext("monitorspec/connector"),
+             mon.findtext("monitorspec/serial") or "")
+            for l in cfg.findall("logicalmonitor")
+            for mon in l.findall("monitor")
+        ))
+        if block_id != full:
+            continue
+        for lm in cfg.findall("logicalmonitor"):
+            key = tuple(sorted(
+                (mon.findtext("monitorspec/connector"),
+                 mon.findtext("monitorspec/serial") or "")
+                for mon in lm.findall("monitor")
+            ))
+            entry = want.get(key)
+            if entry is None:
+                continue
+            w, h, rate, scale, _prim = entry
+            for mon in lm.findall("monitor"):
+                mode = mon.find("mode")
+                if mode is None:
+                    mode = ET.SubElement(mon, "mode")
+                for tag, value in (("width", str(w)), ("height", str(h)),
+                                   ("rate", f"{rate:.3f}")):
+                    node = mode.find(tag)
+                    if node is None:
+                        node = ET.SubElement(mode, tag)
+                    node.text = value
+            scale_node = lm.find("scale")
+            if scale_node is None:
+                scale_node = ET.SubElement(lm, "scale")
+            scale_node.text = format_scale(scale)
+        updated += 1
+
+    if not updated and want:
+        cfg = ET.SubElement(root, "configuration")
+        ET.SubElement(cfg, "layoutmode").text = "logical"
+        for s in states:
+            identity = identity_of(s)
+            entry = want.get(identity)
+            if entry is None:
+                continue
+            w, h, rate, scale, primary = entry
+            lm = ET.SubElement(cfg, "logicalmonitor")
+            ET.SubElement(lm, "x").text = str(s.get("x", 0))
+            ET.SubElement(lm, "y").text = str(s.get("y", 0))
+            ET.SubElement(lm, "scale").text = format_scale(scale)
+            if primary:
+                ET.SubElement(lm, "primary").text = "yes"
+            for conn, _serial in identity:
+                mon = ET.SubElement(lm, "monitor")
+                spec = ET.SubElement(mon, "monitorspec")
+                for tag in ("connector", "vendor", "product", "serial"):
+                    ET.SubElement(spec, tag).text = ""
+                spec.find("connector").text = conn
+                spec.find("serial").text = _serial
+                mode = ET.SubElement(mon, "mode")
+                for tag, value in (("width", str(w)), ("height", str(h)),
+                                   ("rate", f"{rate:.3f}")):
+                    ET.SubElement(mode, tag).text = value
+
+    try:
+        tmp = MONITORS_XML + ".tmp"
+        ET.ElementTree(root).write(tmp, encoding="unicode", xml_declaration=False)
+        ET.parse(tmp)  # never leave a broken config behind
+        os.replace(tmp, MONITORS_XML)
+    except (OSError, ET.ParseError) as exc:
+        try:
+            os.remove(MONITORS_XML + ".tmp")
+        except OSError:
+            pass
+        return f"could not persist {MONITORS_XML}: {exc}"
+    return None
+
+
+def stored_vs_running(states):
+    """Catch the case that eats users' crispness silently: the stored config disagrees
+    with what is running, so the next hotplug or login will undo a live change."""
+    notes = []
+    try:
+        stored = read_monitors_xml()
+    except ValueError as exc:
+        return [str(exc)]
+    full = config_identity(states)
+    for cfg in stored:
+        block_id = tuple(sorted((m["connector"], m["serial"]) for m in cfg["monitors"]))
+        if block_id != full:
+            continue
+        by_lm = {}
+        for m in cfg["monitors"]:
+            by_lm.setdefault(id(m["element"]), []).append(m)
+        for s in states:
+            if s["current"] is None:
+                continue
+            identity = identity_of(s)
+            for lms in by_lm.values():
+                if tuple(sorted((m["connector"], m["serial"]) for m in lms)) != identity:
+                    continue
+                bad = next((m for m in lms if (m["mode"][0], m["mode"][1]) !=
+                            (s["current"][1], s["current"][2])), None)
+                if bad is None and abs(lms[0]["scale"] - s["scale"]) > SCALE_TOL:
+                    bad = lms[0]
+                if bad is not None:
+                    notes.append(
+                        f"{','.join(c for c, _ in identity)}: running "
+                        f"{s['current'][1]}x{s['current'][2]} "
+                        f"scale {s['scale']} but {MONITORS_XML} stores "
+                        f"{bad['mode'][0]}x{bad['mode'][1]} scale {bad['scale']} - the next "
+                        "hotplug or login will switch it back"
+                    )
+    return notes
+
+
+def need_display():
+    if not have_display_config():
+        sys.exit(
+            f"org.gnome.Mutter.DisplayConfig is not available (session type: "
+            f"{session_type()}). This tool needs a GNOME session running Mutter."
+        )
 
 
 def cmd_status(_args):
-    if not have_display_config():
-        sys.exit(
-            f"org.gnome.Mutter.DisplayConfig is not available "
-            f"(session type: {session_type()}). This tool needs a GNOME Wayland session."
-        )
+    need_display()
     _serial, states = read_state()
     if not states:
         sys.exit(
@@ -278,18 +638,21 @@ def cmd_status(_args):
             "session is headless. Re-run with a monitor attached."
         )
     problems = report(states)
+    text_scale = gsettings_float("text-scaling-factor")
     font = gsettings_get("font-name")
-    aa = gsettings_get("font-antialiasing")
-    hint = gsettings_get("font-hinting")
     if font is not None:
-        scale = states[0]["scale"] if states else 1.0
         try:
             pt = float(font.strip("'").rsplit(" ", 1)[1])
-            px_em = pt / 72 * 96 * scale
-            print(f"\nUI font  {font.strip()}  -> {px_em:.1f} device px per em at scale {scale}")
+            px_em = pt / 72 * 96 * states[0]["scale"] * text_scale
+            extra = (f" x text-scaling-factor {text_scale:g} "
+                     f"(effective {states[0]['scale'] * text_scale:g}x)"
+                     if abs(text_scale - 1.0) > 1e-4 else "")
+            print(f"\nUI font  {font.strip()}  -> {px_em:.1f} device px per em "
+                  f"at scale {states[0]['scale']}{extra}")
         except (ValueError, IndexError):
-            pass
-        print(f"antialiasing {aa}   hinting {hint}")
+            print(f"\nUI font  {font.strip()}  (no size set)")
+        print(f"antialiasing {gsettings_get('font-antialiasing')}   "
+              f"hinting {gsettings_get('font-hinting')}")
     broken = 0
     if os.path.exists(FONTCONF):
         ok, err = fontconf_ok(FONTCONF)
@@ -297,80 +660,173 @@ def cmd_status(_args):
             print(f"\nuser fontconfig: {FONTCONF} loads ok")
         else:
             broken = 1
-            print(f"\nWARNING  {FONTCONF} is malformed, so fontconfig has dropped it entirely: "
-                  "Chrome, Blender and Java are silently back on distro defaults.")
+            print(f"\nWARNING  {FONTCONF} is malformed, so fontconfig has dropped it "
+                  "entirely: Chrome, Electron and Java clients are silently back on "
+                  "distro defaults.")
             print(f"  {err}")
+    for note in stored_vs_running(states):
+        print("\nNOTE     " + note)
     print("\n" + ("no non-native resolution detected" if problems == 0 else
                   f"{problems} monitor(s) not running at native resolution"))
     return 0 if (problems == 0 and broken == 0) else 1
 
 
+def plan_fix(states, forced_scale, want_logical_width):
+    changes, skipped = {}, []
+    for i, m in enumerate(states):
+        if m["current"] is None:
+            continue
+        if m["native"] is None:
+            skipped.append(",".join(m["connectors"]))
+            continue
+        needs_mode = resolution_problem(m["current"], m["native"])
+        # switching to native: the scales the *native* mode offers are the ones Mutter
+        # will accept; already native: keep the current mode, i.e. the user's refresh
+        # rate, and only change the scale.
+        target_mode = m["native"] if needs_mode else m["current"]
+        target_scales = (m.get("native_scales") or m["scales"]) if needs_mode else m["scales"]
+        scale = (resolve_scale(forced_scale, target_scales) if forced_scale
+                 else best_integer_scale(target_mode, target_scales, want_logical_width))
+        needs_scale = abs(m["scale"] - scale) > SCALE_TOL
+        if needs_mode or needs_scale:
+            changes[i] = (target_mode[0], float(scale))
+    return changes, skipped
+
+
 def cmd_fix(args):
-    if not have_display_config():
-        sys.exit(
-            f"org.gnome.Mutter.DisplayConfig is not available "
-            f"(session type: {session_type()}). This tool needs a GNOME Wayland session."
-        )
+    need_display()
     _serial, states = read_state()
     if not states:
         sys.exit(
             "no logical monitors reported by Mutter - no display connected, or the "
             "session is headless. Re-run with a monitor attached."
         )
-    prev = load_state()
-    wanted = None
-    skipped = [m["connector"] for m in states if m["native"] is None]
+    try:
+        changes, skipped = plan_fix(states, args.scale, args.want_logical_width)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    drift = stored_vs_running(states)
 
-    for m in states:
-        if m["current"] is None or m["native"] is None:
-            continue
-        scale = args.scale or best_integer_scale(m["native"], args.want_logical_width)
-        if m["current"][1:] != m["native"][1:] or m["scale"] != scale:
-            wanted = (m, m["native"][0], scale)
-            break
+    # text-scaling-factor is only ever set when it is asked for. --scale never borrows it:
+    # shrinking the text does not shrink the desktop, so a scale the mode cannot do stays
+    # refused. A leftover value from an earlier run is reset to 1.0 so it does not linger.
+    target_text_scale = 1.0
+    if args.text_scale is not None:
+        if not 0.5 <= float(args.text_scale) <= 3.0:
+            sys.exit(f"--text-scale must be between 0.5 and 3.0 (got {args.text_scale})")
+        target_text_scale = float(args.text_scale)
+    cur_text = gsettings_float("text-scaling-factor")
+    stale = abs(cur_text - 1.0) > 1e-4
 
-    if wanted is None:
-        print("already at native resolution with the chosen scale")
+    if not changes:
+        print("every output is already at native resolution with the chosen scale")
         if skipped:
             print(f"  (no native mode reported for: {', '.join(skipped)} - left alone)")
-    elif args.dry_run:
-        m, mode_id, scale = wanted
-        print(f"would apply {m['connector']}: {m['current'][0]} scale {m['scale']} "
-              f"-> {mode_id} scale {scale}")
+        for note in drift:
+            print("NOTE     " + note)
     else:
-        m, mode_id, scale = wanted
+        for i, (mode_id, scale) in changes.items():
+            m = states[i]
+            print(f"planned {','.join(m['connectors'])}: "
+                  f"{m['current'][0]} scale {m['scale']} -> {mode_id} scale {scale}")
+        print(f"(untouched outputs: {len(states) - len(changes)})")
+
+    if args.dry_run:
+        if changes or drift:
+            print(f"would persist to {MONITORS_XML} (backup {MONITORS_XML_BACKUP})")
+        if args.text_scale is not None or stale:
+            print(f"would set text-scaling-factor={target_text_scale:g}"
+                  + (f" (was {cur_text:g})" if args.text_scale is None and stale else ""))
+        if not args.no_fonts:
+            rgba, hintstyle, _ga, _gh = PROFILES[args.profile]
+            print(f"would write {FONTCONF} (rgba={rgba}, hintstyle={hintstyle})")
+        return 0
+
+    if changes:
+        prev = load_state()
         if "display" not in prev:
             prev["display"] = [
-                {"connector": s["connector"], "mode": s["current"][0], "scale": s["scale"]}
-                for s in states
-                if s["current"]
+                {"connectors": s["connectors"], "specs": s.get("specs", []),
+                 "mode": s["current"][0], "scale": s["scale"]}
+                for s in states if s["current"]
             ]
             save_state(prev)
-        apply_config(m, mode_id, scale, METHOD_VERIFY)
-        print(f"verified {mode_id} scale {scale} on {m['connector']}")
-        apply_config(m, mode_id, scale, METHOD_PERSIST)
-        print(f"applied {mode_id} scale {scale} on {m['connector']} (persistent)")
+        try:
+            apply_changes(states, changes)
+        except (GLib.Error, RuntimeError) as exc:
+            sys.exit(f"apply failed, nothing changed: {exc}")
+        ok, bad = verify_applied(changes)
+        if not ok:
+            baseline = {
+                i: (s["current"][0], s["scale"])
+                for i, s in enumerate(states) if s["current"]
+            }
+            rolled = False
+            try:
+                apply_changes(states, baseline)
+                rolled, _ = verify_applied(baseline)
+            except (GLib.Error, RuntimeError) as exc:
+                print(f"rollback failed too: {exc}")
+            for line in bad:
+                print("  " + line)
+            sys.exit("the requested configuration did not take effect; "
+                     + ("rolled back to the previous one." if rolled else
+                        "ROLL IT BACK YOURSELF: Settings -> Displays"))
+        for i, (mode_id, scale) in changes.items():
+            print(f"applied {','.join(states[i]['connectors'])}: {mode_id} scale {scale} "
+                  "(read back and confirmed)")
+
+    # nothing to apply live, but the stored file still disagrees with what is running,
+    # and that is what a hotplug or the next login would restore.
+    if changes or drift:
+        existed = os.path.exists(MONITORS_XML)
+        err = persist_monitors_xml(states, changes)
+        if err:
+            print(f"WARNING  {err}")
+            print("  " + ("the live change is in effect, but the next hotplug or login "
+                          "will undo it" if changes else
+                          "nothing live needed changing, but the stored file is what the "
+                          "next hotplug or login will restore"))
+        else:
+            prev = load_state()
+            if "monitors_xml_existed" not in prev:
+                prev["monitors_xml_existed"] = existed
+                save_state(prev)
+            print(f"persisted to {MONITORS_XML} (backup at {MONITORS_XML_BACKUP})")
+
+    if args.text_scale is not None or abs(target_text_scale - cur_text) > 1e-4:
+        prev = load_state()
+        if "interface" not in prev:
+            prev["interface"] = {k: gsettings_get(k) for k in UI_FONT_KEYS}
+            save_state(prev)
+        if args.text_scale is not None:
+            msg = f"set text-scaling-factor={target_text_scale:g}"
+        else:
+            msg = (f"reset text-scaling-factor to {target_text_scale:g} (was {cur_text:g}; "
+                   "--scale never borrows text scaling in place of a framebuffer scale)")
+        if gsettings_op("set", "text-scaling-factor", f"{target_text_scale:g}"):
+            print(msg)
+        else:
+            print(f"WARNING  could not set text-scaling-factor={target_text_scale:g}")
 
     if not args.no_fonts:
         rgba, hintstyle, gnome_aa, gnome_hint = PROFILES[args.profile]
-        if args.dry_run:
-            print(f"would write {FONTCONF} (rgba={rgba}, hintstyle={hintstyle})")
-            return 0
+        prev = load_state()
         if "interface" not in prev:
             prev["interface"] = {k: gsettings_get(k) for k in UI_FONT_KEYS}
-        if os.path.exists(FONTCONF) and "fontconf" not in prev:
-            with open(FONTCONF) as fh:
-                prev["fontconf"] = fh.read()
-            shutil.copy2(FONTCONF, FONTCONF_BACKUP)
+        if "fontconf" not in prev:
+            if os.path.exists(FONTCONF):
+                with open(FONTCONF) as fh:
+                    prev["fontconf"] = fh.read()
+            else:
+                prev["fontconf"] = None
         save_state(prev)
-
         write_fontconf(rgba, hintstyle)
-        gsettings_set("font-rendering", "manual")
-        gsettings_set("font-antialiasing", gnome_aa)
-        gsettings_set("font-hinting", gnome_hint)
+        gsettings_op("set", "font-rendering", "manual")
+        gsettings_op("set", "font-antialiasing", gnome_aa)
+        gsettings_op("set", "font-hinting", gnome_hint)
         print(f"wrote {FONTCONF} and set antialiasing={gnome_aa}, hinting={gnome_hint}")
-        print("profiles: mac (grayscale+slight), sharp (grayscale+full), "
-              "subpixel (rgb+slight)")
+        print("profiles: mac (grayscale+slight), sharp (grayscale+full), subpixel (rgb+slight)")
         print("restart browsers - they read fontconfig once at startup")
     return 0
 
@@ -380,64 +836,444 @@ def cmd_revert(_args):
     if not prev:
         print("nothing recorded in " + STATE_FILE)
         return 1
-    if have_display_config() and prev.get("display"):
-        _serial, states = read_state()
-        for saved in prev["display"]:
-            me = next((s for s in states if s["connector"] == saved["connector"]), None)
-            if me is None:
-                continue
-            try:
-                apply_config(me, saved["mode"], saved["scale"], METHOD_PERSIST)
-                print(f"restored {saved['connector']}: {saved['mode']} scale {saved['scale']}")
-            except GLib.Error as exc:
-                print(f"could not restore {saved['connector']}: {exc.message}")
-    for key, value in (prev.get("interface") or {}).items():
-        if value is None:
-            subprocess.run(
-                ["gsettings", "reset", "org.gnome.desktop.interface", key], capture_output=True
-            )
+    failed = []
+
+    if prev.get("display"):
+        if not have_display_config():
+            failed.append("display")
+            print("cannot restore the display configuration: Mutter's DisplayConfig is not "
+                  "available in this session; Settings -> Displays is the way back")
         else:
-            gsettings_set(key, value.strip("'"))
-    if prev.get("fontconf") is not None:
-        with open(FONTCONF, "w") as fh:
-            fh.write(prev["fontconf"])
-        print(f"restored {FONTCONF}")
-    elif os.path.exists(FONTCONF):
-        os.remove(FONTCONF)
-        print(f"removed {FONTCONF}")
-    os.remove(STATE_FILE)
+            _serial, states = read_state()
+            changes = {}
+            for saved in prev["display"]:
+                want_specs = saved.get("specs")
+                for i, s in enumerate(states):
+                    here = [tuple(c) for c in s.get("specs", [])]
+                    if want_specs:
+                        matched = sorted(here) == sorted(tuple(c) for c in want_specs)
+                    else:  # state recorded before serials were tracked
+                        matched = sorted(s["connectors"]) == sorted(saved["connectors"])
+                    if matched:
+                        changes[i] = (saved["mode"], saved["scale"])
+            if len(changes) != len(states):
+                print("note: the connected output set no longer matches what was recorded; "
+                      "restoring only the outputs that are present")
+            if not states or not changes:
+                failed.append("display")
+                print("could not restore the display configuration: none of the recorded "
+                      f"outputs are connected ({len(states)} reported); leaving "
+                      f"{STATE_FILE} in place")
+            else:
+                try:
+                    apply_changes(states, changes)
+                    ok, bad = verify_applied(changes)
+                    if not ok:
+                        failed.append("display")
+                        print("the restored display configuration did not read back:")
+                        for line in bad:
+                            print("  " + line)
+                    else:
+                        print("restored " + ", ".join(
+                            f"{','.join(s['connectors'])}={changes[i][0]}@{changes[i][1]}"
+                            for i, s in enumerate(states) if i in changes))
+                except (GLib.Error, RuntimeError) as exc:
+                    failed.append("display")
+                    print(f"could not restore the display configuration: {exc}")
+
+    if os.path.exists(MONITORS_XML_BACKUP):
+        try:
+            shutil.copy2(MONITORS_XML_BACKUP, MONITORS_XML)
+            os.remove(MONITORS_XML_BACKUP)
+            print(f"restored {MONITORS_XML} from {MONITORS_XML_BACKUP}")
+        except OSError as exc:
+            failed.append("monitors.xml")
+            print(f"could not restore {MONITORS_XML}: {exc}")
+    elif not prev.get("monitors_xml_existed", True) and os.path.exists(MONITORS_XML):
+        try:
+            os.remove(MONITORS_XML)
+            print(f"removed {MONITORS_XML} (there was none before)")
+        except OSError as exc:
+            failed.append("monitors.xml")
+            print(f"could not remove {MONITORS_XML}: {exc}")
+
+    if prev.get("interface"):
+        for key, value in prev["interface"].items():
+            if value is None:
+                if not gsettings_op("reset", key):
+                    failed.append("gsettings")
+            elif not gsettings_op("set", key, value.strip("'")):
+                failed.append("gsettings")
+
+    if "fontconf" in prev:
+        try:
+            if prev["fontconf"] is None:
+                if os.path.exists(FONTCONF):
+                    os.remove(FONTCONF)
+                print(f"removed {FONTCONF} (there was none before)")
+            else:
+                tmp = FONTCONF + ".tmp"
+                with open(tmp, "w") as fh:
+                    fh.write(prev["fontconf"])
+                os.replace(tmp, FONTCONF)
+                print(f"restored {FONTCONF}")
+            if os.path.exists(FONTCONF_BACKUP):
+                os.remove(FONTCONF_BACKUP)
+        except OSError as exc:
+            failed.append("fontconfig")
+            print(f"could not restore {FONTCONF}: {exc}")
+
+    if failed:
+        print(f"\nnot reverted: {', '.join(sorted(set(failed)))}. Keeping {STATE_FILE} "
+              "so you can try again.")
+        return 1
+    try:
+        os.remove(STATE_FILE)
+    except OSError:
+        pass
     print("reverted; restart browsers")
     return 0
 
 
 def cmd_selftest(_args):
-    """Exercise the detection logic without touching the display."""
+    """Exercise the decision logic without touching the display."""
+    FRAC = 1.6666666269302368  # float32 5/3, exactly as Mutter reports it
+    THIRDS = 1.3333333730697632  # float32 4/3
+    EIGHTHS = 2.6666667461395264  # float32 8/3
+    TEN_THIRDS = 3.3333332538604736  # float32 10/3
+    STEPS4K = [1.0, 1.25, THIRDS, 1.5, FRAC, 2.0, 2.5, EIGHTHS, 3.0, TEN_THIRDS, 3.75, 4.0]
     fake = [
         {  # the bug this tool exists for: 1440p signal on a 4K panel
-            "connector": "DP-1", "x": 0, "y": 0, "scale": 1.0, "transform": 0,
-            "primary": True,
-            "current": ("2560x1440@59.951", 2560, 1440, 59.951),
+            "connectors": ["DP-1"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
+            "primary": True, "current": ("2560x1440@59.951", 2560, 1440, 59.951),
             "native": ("3840x2160@59.997", 3840, 2160, 59.997),
-            "scales": [1.0, 1.25, 1.5, 2.0],
+            "scales": [1.0, 1.25, 1.5, 2.0], "builtin": False,
         },
         {  # correct: native mode, integer scale
-            "connector": "DP-2", "x": 0, "y": 0, "scale": 2.0, "transform": 0,
-            "primary": False,
-            "current": ("3840x2160@59.997", 3840, 2160, 59.997),
+            "connectors": ["DP-2"], "x": 1920, "y": 0, "scale": 2.0, "transform": 0,
+            "primary": False, "current": ("3840x2160@59.997", 3840, 2160, 59.997),
             "native": ("3840x2160@59.997", 3840, 2160, 59.997),
-            "scales": [1.0, 2.0],
+            "scales": [1.0, 2.0], "builtin": False,
         },
     ]
+    mirror = {  # a cloned pair is one logical monitor with two connectors
+        "connectors": ["eDP-1", "DP-3"], "x": 0, "y": 0, "scale": 1.0, "transform": 1,
+        "primary": True, "current": ("2880x1800@60", 2880, 1800, 60.0),
+        "native": ("2880x1800@60", 2880, 1800, 60.0), "scales": [1.0, 2.0], "builtin": True,
+    }
+    stale = {  # native resolution but the panel's 60 Hz preferred mode is unused
+        "connectors": ["DP-4"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
+        "primary": False, "current": ("3840x2160@29.562", 3840, 2160, 29.562),
+        "native": ("3840x2160@59.997", 3840, 2160, 59.997), "scales": [1.0, 2.0],
+        "builtin": False,
+    }
+    # the current mode is 1080p and only offers 1x; the preferred (native) mode offers 2x
+    low_res_scaled = {
+        "connectors": ["DP-5"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
+        "primary": True, "current": ("1920x1080@60", 1920, 1080, 60.0),
+        "native": ("3840x2160@59.997", 3840, 2160, 59.997),
+        "scales": [1.0], "native_scales": [1.0, 1.5, 2.0], "builtin": False,
+    }
+    no_native = {  # untouched output without a preferred mode must not break the write
+        "connectors": ["DP-6"], "x": 3840, "y": 0, "scale": 1.0, "transform": 0,
+        "primary": False, "current": ("1920x1200@59.95", 1920, 1200, 59.95),
+        "native": None, "scales": [1.0], "builtin": False,
+    }
+    # 4K panel with the float32 steps a real Dell U2720Q reports. 1.75 and 1.8 are not
+    # among them (3840/1.8 is not a whole pixel count), so those must be refused
+    frac_panel = {
+        "connectors": ["DP-7"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
+        "primary": True, "current": ("2560x1440@59.951", 2560, 1440, 59.951),
+        "native": ("3840x2160@59.997", 3840, 2160, 59.997),
+        "scales": [1.0, 1.25, 1.5], "native_scales": STEPS4K,
+        "builtin": False,
+    }
+    # the same panel on a cable that stops at 5/3: no integer step to fall back on
+    no_int_panel = dict(frac_panel, connectors=["DP-8"],
+                        native_scales=[1.0, 1.25, THIRDS, 1.5, FRAC])
+
+    def cfg_xml(lms):
+        return ('  <configuration>\n    <layoutmode>logical</layoutmode>\n' + lms
+                + '  </configuration>\n')
+
+    def doc(*cfgs):
+        return '<monitors version="2">\n' + ''.join(cfgs) + '</monitors>\n'
+
+    def mon_xml(conn, serial, vendor, product, w, h, rate):
+        return (f'      <monitor>\n        <monitorspec>\n'
+                f'          <connector>{conn}</connector>\n          <vendor>{vendor}</vendor>\n'
+                f'          <product>{product}</product>\n          <serial>{serial}</serial>\n'
+                f'        </monitorspec>\n        <mode>\n          <width>{w}</width>\n'
+                f'          <height>{h}</height>\n          <rate>{rate}</rate>\n'
+                f'        </mode>\n      </monitor>\n')
+
+    def lm_xml(x, y, scale, monitors, primary=False):
+        return (f'    <logicalmonitor>\n      <x>{x}</x>\n      <y>{y}</y>\n'
+                f'      <scale>{scale}</scale>\n'
+                + ('      <primary>yes</primary>\n' if primary else '')
+                + monitors + '    </logicalmonitor>\n')
+
+    SINGLE_LM = lm_xml(0, 0, "1.5", mon_xml("DP-1", "X", "DEL", "DELL U2720Q",
+                                            3840, 2160, "59.997"), primary=True)
+    OTHER_LM = lm_xml(1920, 0, "1.0", mon_xml("DP-2", "Y", "SAM", "SyncMaster",
+                                              2560, 1440, "59.951"))
+    STALE_LM = lm_xml(0, 0, "1.0", mon_xml("DP-1", "Z", "DEL", "DELL U2415",
+                                           1920, 1080, "60.000"))
+    # a cloned pair is a single <logicalmonitor> holding two <monitor> elements
+    MIRROR_LM = lm_xml(0, 0, "1.0",
+                       mon_xml("eDP-1", "L", "BOE", "0x095D", 2880, 1800, "60.000")
+                       + mon_xml("DP-3", "M", "DEL", "U2720Q", 2880, 1800, "60.000"),
+                       primary=True)
+    SINGLE = doc(cfg_xml(SINGLE_LM))
+    DUAL = doc(cfg_xml(SINGLE_LM + OTHER_LM), cfg_xml(STALE_LM))
+    MIRROR = doc(cfg_xml(MIRROR_LM))
+
+    # monitors.xml persistence, exercised against a scratch copy of the real format
+    import tempfile
+    global MONITORS_XML, MONITORS_XML_BACKUP
+    _real_xml, _real_bak = MONITORS_XML, MONITORS_XML_BACKUP
+    r = {}
+    with tempfile.TemporaryDirectory() as td:
+        MONITORS_XML = os.path.join(td, "monitors.xml")
+        MONITORS_XML_BACKUP = MONITORS_XML + ".bak"
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(SINGLE)
+        running = dict(fake[0], current=("3840x2160@59.997", 3840, 2160, 59.997), scale=1.5,
+                       specs=[("DP-1", "X")], identity=(("DP-1", "X"),))
+        parsed = read_monitors_xml()
+        r["parsed"] = len(parsed) == 1 and parsed[0]["monitors"][0]["scale"] == 1.5
+        r["match_ok"] = stored_vs_running([running]) == []
+        r["stale_detected"] = len(stored_vs_running([dict(running, scale=2.0)])) == 1
+        err = persist_monitors_xml([running], {0: ("3840x2160@59.997", 2.0)})
+        r["persist_ok"] = err is None
+        r["backup_written"] = os.path.exists(MONITORS_XML_BACKUP)
+        after = read_monitors_xml()
+        r["scale_rewritten"] = bool(after) and after[0]["monitors"][0]["scale"] == 2.0
+        r["stale_gone"] = stored_vs_running([dict(running, scale=2.0)]) == []
+        other = persist_monitors_xml(
+            [dict(fake[1], connectors=["DP-9"], specs=[("DP-9", "Y")],
+                  identity=(("DP-9", "Y"),), primary=False)],
+            {0: ("3840x2160@59.997", 2.0)})
+        with open(MONITORS_XML) as fh:
+            txt = fh.read()
+        r["unknown_output_appended"] = other is None and "DP-9" in txt
+        r["other_monitor_block_untouched"] = "<serial>X</serial>" in txt \
+            and txt.count("<configuration>") == 2
+
+        # two monitors running: the <configuration> that holds both is the one to update,
+        # and the single-monitor block for a different panel has to stay as it was
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(DUAL)
+        dual_a = dict(running)
+        dual_b = dict(fake[1], current=("2560x1440@59.951", 2560, 1440, 59.951), scale=1.0,
+                      specs=[("DP-2", "Y")], identity=(("DP-2", "Y"),))
+        dual = [dual_a, dual_b]
+        r["dual_parsed"] = len(read_monitors_xml()) == 2
+        r["dual_match_ok"] = stored_vs_running(dual) == []
+        r["dual_stale_detected"] = len(stored_vs_running([dict(dual_a, scale=2.0),
+                                                         dual_b])) == 1
+        err = persist_monitors_xml(dual, {0: ("3840x2160@59.997", 2.0)})
+        r["dual_persist_ok"] = err is None
+        blocks = {tuple(sorted((m["connector"], m["serial"]) for m in c["monitors"])): c
+                  for c in read_monitors_xml()}
+        pair = blocks.get((("DP-1", "X"), ("DP-2", "Y")))
+        lone = blocks.get((("DP-1", "Z"),))
+        r["dual_scale_rewritten"] = bool(pair) and \
+            [m["scale"] for m in pair["monitors"] if m["connector"] == "DP-1"] == [2.0]
+        r["dual_untouched_keeps_current_mode"] = bool(pair) and \
+            [m["mode"] for m in pair["monitors"] if m["connector"] == "DP-2"] == \
+            [(2560, 1440, 59.951)]
+        r["dual_other_block_untouched"] = bool(lone) and lone["monitors"][0]["mode"] == \
+            (1920, 1080, 60.0) and lone["monitors"][0]["scale"] == 1.0
+        r["dual_block_count"] = len(blocks) == 2
+        r["dual_stale_gone"] = stored_vs_running([dict(dual_a, scale=2.0), dual_b]) == []
+
+        # a mirrored pair is one <logicalmonitor> with two <monitor> elements
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(MIRROR)
+        cloned = dict(mirror, specs=[("eDP-1", "L"), ("DP-3", "M")],
+                      identity=(("DP-3", "M"), ("eDP-1", "L")))
+        parsed = read_monitors_xml()
+        r["mirrored_both_monitors_parsed"] = len(parsed) == 1 and \
+            len(parsed[0]["monitors"]) == 2
+        r["mirrored_stale_detected"] = len(stored_vs_running([dict(cloned, scale=2.0)])) == 1
+        err = persist_monitors_xml([cloned], {0: ("2880x1800@60", 2.0)})
+        with open(MONITORS_XML) as fh:
+            txt = fh.read()
+        r["mirrored_persist_ok"] = err is None and txt.count("<logicalmonitor>") == 1 and \
+            all(m["scale"] == 2.0 for m in read_monitors_xml()[0]["monitors"])
+
+        # an untouched output with native=None must not crash, and the block that gets
+        # appended must keep the real layout instead of stacking everything at 0,0
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(SINGLE)
+        err = persist_monitors_xml([running, no_native], {})
+        with open(MONITORS_XML) as fh:
+            txt = fh.read()
+        blocks = {tuple(sorted((m["connector"], m["serial"]) for m in c["monitors"])): c
+                  for c in read_monitors_xml()}
+        added = blocks.get((("DP-1", "X"), ("DP-6", "")))
+        r["untouched_without_native_persisted"] = err is None and bool(added)
+        r["appended_block_keeps_layout"] = bool(added) and "<x>3840</x>" in txt and \
+            [m["mode"] for m in added["monitors"] if m["connector"] == "DP-6"] == \
+            [(1920, 1200, 59.95)]
+        r["appended_block_keeps_running_scale"] = bool(added) and \
+            [m["scale"] for m in added["monitors"] if m["connector"] == "DP-1"] == [1.5]
+
+        # Mutter's 5/3 step has to survive being written and read back: %g-style rounding
+        # to 1.66667 is a different scale and reads as stored-vs-running drift forever
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(SINGLE)
+        frac = dict(running, scale=FRAC)
+        err = persist_monitors_xml([frac], {0: ("3840x2160@59.997", FRAC)})
+        back = read_monitors_xml()
+        r["fractional_scale_exact"] = err is None and bool(back) and \
+            back[0]["monitors"][0]["scale"] == FRAC
+        r["fractional_scale_no_drift"] = stored_vs_running([frac]) == []
+
+        with open(MONITORS_XML, "w") as fh:
+            fh.write("<monitors version='2'><configuration>")
+        r["malformed_detected"] = False
+        try:
+            read_monitors_xml()
+        except ValueError:
+            r["malformed_detected"] = True
+        r["malformed_not_edited"] = persist_monitors_xml(
+            [running], {0: ("3840x2160@59.997", 2.0)}) is not None
+
+        # a scratch fonts.conf has to be validated as itself, not against ~/.config
+        good_fonts = os.path.join(td, "fonts-good.conf")
+        bad_fonts = os.path.join(td, "fonts-bad.conf")
+        with open(good_fonts, "w") as fh:
+            fh.write(fontconf_body(*PROFILES["mac"][:2]))
+        with open(bad_fonts, "w") as fh:
+            fh.write('<fontconfig>\n  <match target="font"\n')
+        have_fc = bool(shutil.which("fc-match"))
+        r["fontconf_scratch_valid"] = (not have_fc) or fontconf_ok(good_fonts)[0]
+        r["fontconf_scratch_malformed"] = (not have_fc) or (not fontconf_ok(bad_fonts)[0])
+    MONITORS_XML, MONITORS_XML_BACKUP = _real_xml, _real_bak
+    try:
+        plan_fix([frac_panel], 5.0, 1920)
+        r["forced_scale_rejected"] = False
+    except ValueError as exc:
+        r["forced_scale_rejected"] = "5.0" in str(exc) and str(FRAC) in str(exc) and \
+            str(THIRDS) in str(exc)
+    try:
+        plan_fix([frac_panel], 1.75, 1920)
+        r["whole_pixel_rejected"] = ""
+    except ValueError as exc:
+        r["whole_pixel_rejected"] = str(exc)
+    try:
+        plan_fix([frac_panel], 1.8, 1920)
+        r["scale_18_rejected"] = ""
+    except ValueError as exc:
+        r["scale_18_rejected"] = str(exc)
+    try:
+        plan_fix([no_int_panel], 2.7, 1920)
+        r["no_integer_step_rejected"] = False
+    except ValueError as exc:
+        r["no_integer_step_rejected"] = "2.7" in str(exc) and str(FRAC) in str(exc)
+
     checks = [
         ("detects upscaled signal", len(find_problems(fake)) == 1),
         ("names the right connector", find_problems(fake)[0].startswith("DP-1")),
         ("leaves native+2x alone", find_problems(fake[1:]) == []),
-        ("flags fractional scale", len(find_notes(fake[:1])) == 0
-         and len(find_notes([dict(fake[1], scale=1.5)])) == 1),
-        ("picks 2x on 4K", best_integer_scale(fake[0]["native"], 1920) == 2.0),
-        ("picks 1x on 1440p panel", best_integer_scale((None, 2560, 1440, 60), 1920) == 1.0),
+        ("ignores refresh-rate mismatch", find_problems([stale]) == []),
+        ("flags fractional scale", find_notes([dict(fake[1], scale=1.5)]) != []),
+        ("picks 2x on 4K", best_integer_scale(fake[0]["native"], [1.0, 2.0], 1920) == 2.0),
+        ("picks 1x on 1440p panel", best_integer_scale((None, 2560, 1440, 60), [], 1920) == 1.0),
         ("honours wanted logical width",
-         best_integer_scale(fake[0]["native"], 2560) == 1.0),
+         best_integer_scale(fake[0]["native"], [1.0, 1.5, 2.0], 2560) == 1.0),
+        ("never returns an unoffered scale",
+         best_integer_scale(fake[0]["native"], [1.0, 1.25, 1.5], 1920) in [1.0, 1.25, 1.5]),
+        ("prefers pixel-exact integer when 2x is unavailable",
+         best_integer_scale(fake[0]["native"], [1.0, 1.25, 1.5], 1920) == 1.0),
+        ("plan leaves healthy output alone",
+         plan_fix(fake, None, 1920)[0] == {0: ("3840x2160@59.997", 2.0)}),
+        ("apply list keeps every output",
+         len(build_apply_list(fake, {0: ("3840x2160@59.997", 2.0)})) == 2),
+        ("untouched outputs keep their mode",
+         build_apply_list(fake, {0: ("3840x2160@59.997", 2.0)})[1] ==
+         (1920, 0, 2.0, 0, False, [("DP-2", "3840x2160@59.997", {})])),
+        ("mirrored pair keeps both connectors",
+         build_apply_list([mirror], {}) [0][5] ==
+         [("eDP-1", "2880x1800@60", {}), ("DP-3", "2880x1800@60", {})]),
+        ("built-in flagged in the warning", "built-in" in find_problems([
+            dict(mirror, current=("1920x1200@60", 1920, 1200, 60.0))])[0]),
+        ("plan uses the native mode's scales",
+         plan_fix([low_res_scaled], None, 1920)[0] == {0: ("3840x2160@59.997", 2.0)}),
+        ("plan keeps the current refresh rate",
+         plan_fix([stale], None, 1920)[0] == {0: ("3840x2160@29.562", 2.0)}),
+        ("plan snaps --scale 1.67 to the mode's 5/3 step",
+         plan_fix([frac_panel], 1.67, 1920)[0] == {0: ("3840x2160@59.997", FRAC)}),
+        ("plan snaps --scale 1.33 to the mode's 4/3 step",
+         plan_fix([frac_panel], 1.33, 1920)[0] == {0: ("3840x2160@59.997", THIRDS)}),
+        ("--scale 1.6 is shorthand for the float32 5/3 step",
+         resolve_scale(1.6, STEPS4K) == FRAC),
+        ("--scale 1.66 and 1.67 are shorthand for 5/3",
+         resolve_scale(1.66, STEPS4K) == FRAC and resolve_scale(1.67, STEPS4K) == FRAC),
+        ("--scale 1.3 and 1.33 are shorthand for 4/3",
+         resolve_scale(1.3, STEPS4K) == THIRDS and resolve_scale(1.33, STEPS4K) == THIRDS),
+        ("--scale 2.6, 2.66 and 2.67 are shorthand for 8/3",
+         all(resolve_scale(v, STEPS4K) == EIGHTHS for v in (2.6, 2.66, 2.67))),
+        ("--scale 3.3 and 3.33 are shorthand for 10/3",
+         resolve_scale(3.3, STEPS4K) == TEN_THIRDS and
+         resolve_scale(3.33, STEPS4K) == TEN_THIRDS),
+        ("an offered scale passes through untouched",
+         resolve_scale(2, STEPS4K) == 2.0 and resolve_scale(1.5, STEPS4K) == 1.5 and
+         resolve_scale(3.75, STEPS4K) == 3.75),
+        ("plan snaps --scale 1.6 to a 5/3 framebuffer",
+         plan_fix([frac_panel], 1.6, 1920)[0] == {0: ("3840x2160@59.997", FRAC)}),
+        ("plan refuses 1.75 as not dividing the mode into whole pixels",
+         bool(r["whole_pixel_rejected"]) and "1.75" in r["whole_pixel_rejected"] and
+         "whole pixels" in r["whole_pixel_rejected"] and
+         str(FRAC) in r["whole_pixel_rejected"]),
+        ("plan refuses 1.8 and offers --text-scale instead of doing it silently",
+         bool(r["scale_18_rejected"]) and "1.8" in r["scale_18_rejected"] and
+         "text-scaling-factor" in r["scale_18_rejected"] and
+         "--text-scale" in r["scale_18_rejected"]),
+        ("plan refuses a scale beyond every offered step", r["forced_scale_rejected"]),
+        ("plan refuses 2.7 when the steps stop at 5/3", r["no_integer_step_rejected"]),
+        ("resolve_scale passes a scale through when the mode lists none",
+         resolve_scale(1.75, []) == 1.75),
+        ("stored monitors.xml parsed", r["parsed"]),
+        ("running match produces no note", r["match_ok"]),
+        ("stored-vs-running mismatch detected", r["stale_detected"]),
+        ("persist reports success", r["persist_ok"]),
+        ("persist backs up monitors.xml", r["backup_written"]),
+        ("persist rewrites the stored scale", r["scale_rewritten"]),
+        ("mismatch gone after persist", r["stale_gone"]),
+        ("unmatched output gets a new block", r["unknown_output_appended"]),
+        ("same connector, different serial: other block untouched",
+         r["other_monitor_block_untouched"]),
+        ("dual-monitor file parsed", r["dual_parsed"]),
+        ("dual-monitor match produces no note", r["dual_match_ok"]),
+        ("dual-monitor mismatch detected", r["dual_stale_detected"]),
+        ("dual-monitor persist reports success", r["dual_persist_ok"]),
+        ("dual-monitor scale rewritten", r["dual_scale_rewritten"]),
+        ("untouched output keeps its current mode, not the native one",
+         r["dual_untouched_keeps_current_mode"]),
+        ("single-monitor block untouched by a dual-monitor write",
+         r["dual_other_block_untouched"]),
+        ("persist neither merged nor dropped a block", r["dual_block_count"]),
+        ("dual-monitor mismatch gone after persist", r["dual_stale_gone"]),
+        ("mirrored logical monitor parsed as two monitors",
+         r["mirrored_both_monitors_parsed"]),
+        ("mirrored pair mismatch detected once", r["mirrored_stale_detected"]),
+        ("mirrored pair stored in one logical monitor", r["mirrored_persist_ok"]),
+        ("fractional scale written and read back exactly", r["fractional_scale_exact"]),
+        ("fractional scale reports no stored-vs-running drift",
+         r["fractional_scale_no_drift"]),
+        ("untouched output without a native mode persisted",
+         r["untouched_without_native_persisted"]),
+        ("appended block keeps each output's real position and mode",
+         r["appended_block_keeps_layout"]),
+        ("appended block keeps an untouched output's scale",
+         r["appended_block_keeps_running_scale"]),
+        ("malformed monitors.xml detected", r["malformed_detected"]),
+        ("malformed monitors.xml refused, not edited", r["malformed_not_edited"]),
+        ("valid scratch fonts.conf accepted", r["fontconf_scratch_valid"]),
+        ("malformed scratch fonts.conf rejected", r["fontconf_scratch_malformed"]),
         ("user fonts.conf parses (if present)",
          (not os.path.exists(FONTCONF)) or fontconf_ok(FONTCONF)[0]),
     ]
@@ -459,17 +1295,23 @@ def main():
     sub.add_parser("status", help="report active vs native mode and scale")
 
     f = sub.add_parser("fix", help="switch to native mode with an integer scale")
-    f.add_argument("--scale", type=float, help="force a framebuffer scale (e.g. 2)")
+    f.add_argument("--scale", type=float, help="force a framebuffer scale (e.g. 2, or 1.6 "
+                                               "for Mutter's 5/3 step); a scale the mode "
+                                               "does not offer is refused, not faked with "
+                                               "text scaling")
+    f.add_argument("--text-scale", type=float,
+                   help="set text-scaling-factor (e.g. 0.9); this only resizes GNOME text, "
+                        "not windows, Chrome or Electron")
     f.add_argument("--want-logical-width", type=int, default=1920,
-                   help="logical desktop width to aim for when picking an integer scale")
+                   help="keep at least this many logical pixels wide when picking an "
+                        "integer scale (default 1920)")
     f.add_argument("--profile", choices=sorted(PROFILES), default="mac",
                    help="antialiasing profile to install (default: mac)")
     f.add_argument("--no-fonts", action="store_true", help="only touch the display config")
-    f.add_argument("--dry-run", action="store_true", help="print what would happen")
+    f.add_argument("--dry-run", action="store_true", help="print what would change")
 
-    sub.add_parser("revert", help="restore the previous mode, scale, gsettings and fonts.conf")
-
-    sub.add_parser("selftest", help="check the detection logic without touching the display")
+    sub.add_parser("revert", help="restore the recorded mode, scale, gsettings and fonts.conf")
+    sub.add_parser("selftest", help="check the decision logic without touching the display")
 
     args = p.parse_args()
     return {"status": cmd_status, "fix": cmd_fix, "revert": cmd_revert,

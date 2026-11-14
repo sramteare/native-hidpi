@@ -101,6 +101,13 @@ resampled down, and apps that ignore scaling end up a different size from their
 neighbours. Measured on a single scaled monitor; with several outputs `Xft.dpi` is global,
 so read it with care.
 
+Fractional scales are float32 values, not decimal ones: between 1.5 and 2.0 on a 4K panel
+Mutter offers `1.6666666269302368` (5/3), because 3840/1.75 is not an integer. So `--scale`
+snaps to the closest scale the mode actually offers (`--scale 1.67` → 5/3, `--scale 1.33`
+→ 4/3) and refuses one that is further out (`--scale 1.75`) rather than send something
+Mutter will round behind your back. The same value goes into `monitors.xml`: writing
+`1.66667` there is a *different* scale, and `status` would report drift that is not real.
+
 Chrome is the client people notice. The Chrome 157 build tested here binds `wp_viewport`
 and contains **no** `zwp_fractional_scale` symbols, i.e. it does not appear to implement
 `fractional-scale-v1`, so fractional scaling looked soft in Chrome even though Chrome was
@@ -152,14 +159,15 @@ local configuration, not from a distro default - `status` prints what you actual
 All of these belong to `fix`:
 
 ```
-native-hidpi fix --scale 2                  force a framebuffer scale
+native-hidpi fix --scale 2                  force a framebuffer scale (snapped to the
+                                            closest scale the mode actually offers)
 native-hidpi fix --want-logical-width 1920  keep at least this many logical px wide
 native-hidpi fix --profile sharp            antialiasing profile
 native-hidpi fix --no-fonts                 display config only
 native-hidpi fix --dry-run                  print what would change
 ```
 
-Other subcommands: `status`, `revert`, `selftest` (46 assertions on the decision logic,
+Other subcommands: `status`, `revert`, `selftest` (52 assertions on the decision logic,
 including a scratch `monitors.xml`; touches no display and no real config).
 
 ## Safety
@@ -172,6 +180,8 @@ including a scratch `monitors.xml`; touches no display and no real config).
   restored, and Settings -> Displays remains the way out.
 - `monitors.xml` is matched by connector **and serial**, backed up once, and is never
   edited if it does not parse.
+- Scales are compared with a float32-sized tolerance (1e-5) and written back at full
+  precision, so a fractional scale neither looks like drift nor gets truncated.
 - An output that needs no change keeps the mode it is on, refresh rate included: fixing
   the scale on a 4K panel already running 4K@30 does not silently move it to 4K@60.
 - What `revert` restores is recorded per connector **and serial**, and is read back to

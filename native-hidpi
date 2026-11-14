@@ -34,6 +34,10 @@ APPLY_SIG = "(uua(iiduba(ssa{sv}))a{sv})"
 # trusting a separate verify step.
 METHOD_PERSIST = 2
 
+# Mutter reports and accepts scales as float32: 5/3 comes back as 1.6666666269302368, so
+# two scales that mean the same thing never compare exactly.
+SCALE_TOL = 1e-5
+
 STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "native-hidpi"
 )
@@ -145,6 +149,21 @@ def best_integer_scale(native, scales, want_logical_width=1920):
     return max(offered) if offered else 1.0
 
 
+def resolve_scale(forced_scale, scales):
+    """Snap --scale onto a scale the mode really offers. Mutter's fractional steps are
+    float32 values (5/3 = 1.6666666269302368), so '1.67' has to become that exact value
+    rather than be sent as-is and rejected or silently rounded."""
+    offered = [float(s) for s in scales or []]
+    if not offered:
+        return float(forced_scale)
+    closest = min(offered, key=lambda s: abs(s - float(forced_scale)))
+    if abs(closest - float(forced_scale)) <= 0.02:
+        return float(closest)
+    raise ValueError(
+        f"scale {forced_scale} is not offered by this mode; the closest available is "
+        f"{closest} (supported: {', '.join(str(s) for s in offered)})")
+
+
 def build_apply_list(states, changes):
     """The logical_monitors array is the complete desired configuration: anything left
     out is disabled. Always send every output, changing only what was asked for."""
@@ -184,7 +203,8 @@ def verify_applied(changes, retries=1):
                 bad.append(f"output {i} missing")
                 continue
             s = states[i]
-            if s["current"] is None or s["current"][0] != mode_id or abs(s["scale"] - scale) > 1e-6:
+            if s["current"] is None or s["current"][0] != mode_id or \
+                    abs(s["scale"] - scale) > SCALE_TOL:
                 got = s["current"][0] if s["current"] else "none"
                 bad.append(f"{','.join(s['connectors'])}: wanted {mode_id} scale {scale}, got {got} scale {s['scale']}")
         if not bad:
@@ -376,6 +396,14 @@ def mode_geometry(s, mode_id):
     return (fallback[1], fallback[2], fallback[3]) if fallback else (0, 0, 0.0)
 
 
+def format_scale(scale):
+    """Write the scale back exactly as Mutter reports it. Its fractional steps are float32
+    values (5/3 reads back as 1.6666666269302368), and a %.6g-style truncation to 1.66667
+    is a different scale that then looks like stored-vs-running drift forever."""
+    scale = float(scale)
+    return str(int(scale)) if scale.is_integer() else str(scale)
+
+
 def read_monitors_xml():
     """Return the stored configurations as a list of dicts, or [] if there is no file.
     Raises ValueError if the file cannot be parsed."""
@@ -482,7 +510,7 @@ def persist_monitors_xml(states, changes):
             scale_node = lm.find("scale")
             if scale_node is None:
                 scale_node = ET.SubElement(lm, "scale")
-            scale_node.text = f"{scale:g}"
+            scale_node.text = format_scale(scale)
         updated += 1
 
     if not updated and want:
@@ -497,7 +525,7 @@ def persist_monitors_xml(states, changes):
             lm = ET.SubElement(cfg, "logicalmonitor")
             ET.SubElement(lm, "x").text = str(s.get("x", 0))
             ET.SubElement(lm, "y").text = str(s.get("y", 0))
-            ET.SubElement(lm, "scale").text = f"{scale:g}"
+            ET.SubElement(lm, "scale").text = format_scale(scale)
             if primary:
                 ET.SubElement(lm, "primary").text = "yes"
             for conn, _serial in identity:
@@ -551,7 +579,7 @@ def stored_vs_running(states):
                     continue
                 bad = next((m for m in lms if (m["mode"][0], m["mode"][1]) !=
                             (s["current"][1], s["current"][2])), None)
-                if bad is None and abs(lms[0]["scale"] - s["scale"]) > 1e-6:
+                if bad is None and abs(lms[0]["scale"] - s["scale"]) > SCALE_TOL:
                     bad = lms[0]
                 if bad is not None:
                     notes.append(
@@ -624,9 +652,9 @@ def plan_fix(states, forced_scale, want_logical_width):
         # rate, and only change the scale.
         target_mode = m["native"] if needs_mode else m["current"]
         target_scales = (m.get("native_scales") or m["scales"]) if needs_mode else m["scales"]
-        scale = forced_scale or best_integer_scale(target_mode, target_scales,
-                                                   want_logical_width)
-        needs_scale = abs(m["scale"] - scale) > 1e-6
+        scale = (resolve_scale(forced_scale, target_scales) if forced_scale
+                 else best_integer_scale(target_mode, target_scales, want_logical_width))
+        needs_scale = abs(m["scale"] - scale) > SCALE_TOL
         if needs_mode or needs_scale:
             changes[i] = (target_mode[0], float(scale))
     return changes, skipped
@@ -640,7 +668,10 @@ def cmd_fix(args):
             "no logical monitors reported by Mutter - no display connected, or the "
             "session is headless. Re-run with a monitor attached."
         )
-    changes, skipped = plan_fix(states, args.scale, args.want_logical_width)
+    try:
+        changes, skipped = plan_fix(states, args.scale, args.want_logical_width)
+    except ValueError as exc:
+        sys.exit(str(exc))
     drift = stored_vs_running(states)
 
     if not changes:
@@ -844,6 +875,8 @@ def cmd_revert(_args):
 
 def cmd_selftest(_args):
     """Exercise the decision logic without touching the display."""
+    FRAC = 1.6666666269302368  # float32 5/3, exactly as Mutter reports it
+    THIRDS = 1.3333333730697632  # float32 4/3
     fake = [
         {  # the bug this tool exists for: 1440p signal on a 4K panel
             "connectors": ["DP-1"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
@@ -880,6 +913,15 @@ def cmd_selftest(_args):
         "connectors": ["DP-6"], "x": 3840, "y": 0, "scale": 1.0, "transform": 0,
         "primary": False, "current": ("1920x1200@59.95", 1920, 1200, 59.95),
         "native": None, "scales": [1.0], "builtin": False,
+    }
+    # 4K panel with float32 fractional steps; 1.75 is not one of them (3840/1.75 is not
+    # an integer), so a forced scale has to snap to the closest offered value
+    frac_panel = {
+        "connectors": ["DP-7"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
+        "primary": True, "current": ("2560x1440@59.951", 2560, 1440, 59.951),
+        "native": ("3840x2160@59.997", 3840, 2160, 59.997),
+        "scales": [1.0, 1.25, 1.5], "native_scales": [1.0, THIRDS, FRAC, 2.0],
+        "builtin": False,
     }
 
     def cfg_xml(lms):
@@ -1010,6 +1052,17 @@ def cmd_selftest(_args):
         r["appended_block_keeps_running_scale"] = bool(added) and \
             [m["scale"] for m in added["monitors"] if m["connector"] == "DP-1"] == [1.5]
 
+        # Mutter's 5/3 step has to survive being written and read back: %g-style rounding
+        # to 1.66667 is a different scale and reads as stored-vs-running drift forever
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(SINGLE)
+        frac = dict(running, scale=FRAC)
+        err = persist_monitors_xml([frac], {0: ("3840x2160@59.997", FRAC)})
+        back = read_monitors_xml()
+        r["fractional_scale_exact"] = err is None and bool(back) and \
+            back[0]["monitors"][0]["scale"] == FRAC
+        r["fractional_scale_no_drift"] = stored_vs_running([frac]) == []
+
         with open(MONITORS_XML, "w") as fh:
             fh.write("<monitors version='2'><configuration>")
         r["malformed_detected"] = False
@@ -1031,6 +1084,12 @@ def cmd_selftest(_args):
         r["fontconf_scratch_valid"] = (not have_fc) or fontconf_ok(good_fonts)[0]
         r["fontconf_scratch_malformed"] = (not have_fc) or (not fontconf_ok(bad_fonts)[0])
     MONITORS_XML, MONITORS_XML_BACKUP = _real_xml, _real_bak
+    try:
+        plan_fix([frac_panel], 1.75, 1920)
+        r["forced_scale_rejected"] = False
+    except ValueError as exc:
+        r["forced_scale_rejected"] = "1.75" in str(exc) and str(FRAC) in str(exc) and \
+            str(THIRDS) in str(exc)
 
     checks = [
         ("detects upscaled signal", len(find_problems(fake)) == 1),
@@ -1062,6 +1121,13 @@ def cmd_selftest(_args):
          plan_fix([low_res_scaled], None, 1920)[0] == {0: ("3840x2160@59.997", 2.0)}),
         ("plan keeps the current refresh rate",
          plan_fix([stale], None, 1920)[0] == {0: ("3840x2160@29.562", 2.0)}),
+        ("plan snaps --scale 1.67 to the mode's 5/3 step",
+         plan_fix([frac_panel], 1.67, 1920)[0] == {0: ("3840x2160@59.997", FRAC)}),
+        ("plan snaps --scale 1.33 to the mode's 4/3 step",
+         plan_fix([frac_panel], 1.33, 1920)[0] == {0: ("3840x2160@59.997", THIRDS)}),
+        ("plan refuses a scale the mode does not offer", r["forced_scale_rejected"]),
+        ("resolve_scale passes a scale through when the mode lists none",
+         resolve_scale(1.75, []) == 1.75),
         ("stored monitors.xml parsed", r["parsed"]),
         ("running match produces no note", r["match_ok"]),
         ("stored-vs-running mismatch detected", r["stale_detected"]),
@@ -1087,6 +1153,9 @@ def cmd_selftest(_args):
          r["mirrored_both_monitors_parsed"]),
         ("mirrored pair mismatch detected once", r["mirrored_stale_detected"]),
         ("mirrored pair stored in one logical monitor", r["mirrored_persist_ok"]),
+        ("fractional scale written and read back exactly", r["fractional_scale_exact"]),
+        ("fractional scale reports no stored-vs-running drift",
+         r["fractional_scale_no_drift"]),
         ("untouched output without a native mode persisted",
          r["untouched_without_native_persisted"]),
         ("appended block keeps each output's real position and mode",

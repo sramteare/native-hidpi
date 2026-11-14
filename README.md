@@ -1,21 +1,21 @@
 # native-hidpi
 
-Find out whether your monitor is being fed the wrong resolution, and fix it.
+Find out whether your monitor is being fed the wrong resolution, and fix it
+**permanently**.
 
-On GNOME + Wayland. One file, no dependencies beyond `python3-gi`.
+On GNOME (Mutter) with Wayland. One file; needs `python3-gi`, plus `gsettings` and
+`fc-match` for the font half.
 
 ## The problem this looks for
 
-"Ubuntu fonts look blurry", "everything looks a bit soft", "why doesn't Linux look
-like a Mac" is very often **not** a font problem. A depressingly common setup is a 4K
-monitor driven at 2560x1440, because that was the mode someone picked years ago, or
-because a docking station negotiated it once and it stuck. The panel then upscales a
-1440p image by 1.5x in its own scaler, so *every pixel on screen* is resampled before
-you see it.
+"Ubuntu fonts look blurry", "everything looks a bit soft", "why doesn't Linux look like a
+Mac" is very often **not** a font problem. A common setup is a 4K monitor driven at
+2560x1440, because that mode was picked once, or a docking station negotiated it and it
+stuck. The panel then upscales a 1440p image by 1.5x in its own scaler, so *every pixel on
+screen* is resampled before you see it.
 
-Nothing tells you this. The resolution list doesn't warn you, and no amount of
-fontconfig, hinting, antialiasing, `text-scaling-factor`, or Infinality-style tuning
-will recover detail that was never rendered.
+Nothing warns you. And no amount of fontconfig, hinting, `text-scaling-factor`, RGB order
+or Infinality-style tuning recovers detail that was never rasterized.
 
 ```
 $ native-hidpi status
@@ -29,26 +29,51 @@ WARNING  DP-1: 2560x1440 signal on a 3840x2160 panel, monitor upscales x1.50.
 Everything on screen is soft and no font setting will fix it.
 ```
 
+## Why your change keeps disappearing
+
+This is the part that costs people hours. Applying a mode over DBus does not reliably
+rewrite `~/.config/monitors.xml`, and that file is what Mutter restores after a **hotplug
+or a login**. Observed on GNOME Shell 50.1:
+
+```
+$ native-hidpi fix            # 1.5 -> 2.0, confirmed by reading Mutter's state back
+$ stat -c %y ~/.config/monitors.xml     # unchanged: still the old timestamp
+... unplug and replug the monitor ...
+$ native-hidpi status         # scale 1.5 again
+```
+
+So a live change looks applied, and then quietly isn't. `fix` therefore writes
+`monitors.xml` itself, matching the stored block by connector **and serial** - connector
+names are reused between monitors, and a real config file on the author's machine has two
+different panels both called `DP-1`. Blocks for other monitors or other layouts are left
+alone, and the original file is backed up.
+
+`status` reports the mismatch when it appears:
+
+```
+NOTE     DP-1: running 3840x2160 scale 2.0 but ~/.config/monitors.xml stores
+         3840x2160 scale 1.5 - the next hotplug or login will switch it back
+```
+
 ## Fixing it
 
 ```
 $ native-hidpi fix
-verified 3840x2160@59.997 scale 2.0 on DP-1
-applied 3840x2160@59.997 scale 2.0 on DP-1 (persistent)
+planned DP-1: 2560x1440@59.951 scale 1.0 -> 3840x2160@59.997 scale 2.0
+(untouched outputs: 0)
+applied DP-1: 3840x2160@59.997 scale 2.0 (read back and confirmed)
+persisted to ~/.config/monitors.xml (backup at ~/.config/monitors.xml.native-hidpi.bak)
 wrote ~/.config/fontconfig/fonts.conf and set antialiasing=grayscale, hinting=slight
 ```
 
-`fix` does two things:
-
-1. Switches the output to its **native mode** (from the EDID `is-preferred` entry) with
-   an **integer framebuffer scale**, via `org.gnome.Mutter.DisplayConfig`. This is
-   verified (`METHOD_VERIFY`) before it is applied.
-2. Sets a sane antialiasing profile: GSettings for GNOME/GTK/Qt/snap-Firefox, plus
-   `~/.config/fontconfig/fonts.conf` for Chrome, Blender, Java and everything else that
-   reads fontconfig instead.
-
-The previous mode, scale, GSettings values and `fonts.conf` are recorded in
-`~/.local/state/native-hidpi/state.json`, so `native-hidpi revert` puts everything back.
+1. Applies native mode + integer framebuffer scale over `org.gnome.Mutter.DisplayConfig`,
+   sending **every** connected output in one configuration - the array is the complete
+   desired state, so anything omitted gets disabled.
+2. Reads the result back and, if it did not take, re-applies the previous configuration.
+   Mutter documents the `method` flags inconsistently between versions, so this tool does
+   not rely on a "verify" flag: it applies once and checks the outcome.
+3. Persists to `monitors.xml`.
+4. Installs an antialiasing profile in GSettings *and* `~/.config/fontconfig/fonts.conf`.
 
 Browsers read fontconfig once at startup, so restart them.
 
@@ -63,24 +88,27 @@ physical pixel.
 | 3840x2160 | 2x | 1920x1080 | **yes** |
 | 3840x2160 | 1.5x | 2560x1440 | no - resampled in the GPU |
 
-Fractional scale has a second cost that is easy to miss: Mutter keeps `Xft.dpi` at
-`96 * next integer` (192 at 1.5x), so XWayland and Electron windows render at 2x and get
-resampled down, and apps that ignore fractional scaling end up a different size from
-their neighbours. `status` prints a note when it sees this.
+At a fractional monitor scale, Mutter reports `Xft.dpi` as `96 * next integer` (192 at
+1.5x), so clients that do not implement `fractional-scale-v1` render at 2x and get
+resampled down, and apps that ignore scaling end up a different size from their
+neighbours. Measured on a single scaled monitor; with several outputs `Xft.dpi` is global,
+so read it with care.
 
-And Chrome specifically: the Chrome 157 binary on this machine binds `wp_viewport` but
-contains **no** `zwp_fractional_scale` symbols, i.e. it does not implement
-`fractional-scale-v1`. Even as a native Wayland client it renders at the next integer
-scale and the compositor resamples it, so fractional scaling never looks right in Chrome.
-Check your own build:
+Chrome is the client people notice. The Chrome 157 build tested here binds `wp_viewport`
+and contains **no** `zwp_fractional_scale` symbols, i.e. it does not appear to implement
+`fractional-scale-v1`, so fractional scaling looked soft in Chrome even though Chrome was
+running as a native Wayland client (it held a wayland socket, no X11). Check your own
+build - presence of the symbols is a compile-time indication, not proof of runtime
+negotiation:
 
 ```bash
 strings -a /opt/google/chrome/chrome | grep -oE "zwp_fractional_scale[a-z_]*|wp_viewport" | sort -u
 ```
 
-If 2x makes everything too big, shrink the contents rather than the pixel grid:
+If 2x makes everything too big, shrink the contents rather than the pixel grid and keep
+the crispness:
 
-```
+```bash
 gsettings set org.gnome.desktop.interface font-name "Ubuntu Sans 11"
 gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
 ```
@@ -89,56 +117,89 @@ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
 
 | profile | fontconfig | GSettings | notes |
 |---|---|---|---|
-| `mac` (default) | `rgba=none`, `hintslight` | grayscale, slight | what macOS does; correct at 2x |
+| `mac` (default) | `rgba=none`, `hintslight` | grayscale, slight | approximates macOS text: grayscale AA with light hinting (macOS adds its own stem darkening, which FreeType/fontconfig here do not expose) |
 | `sharp` | `rgba=none`, `hintfull` | grayscale, full | maximum edge definition at 1x |
-| `subpixel` | `rgba=rgb`, `hintslight` | rgba, slight | only worth trying on a sub-110 PPI 1x panel |
+| `subpixel` | `rgba=rgb`, `hintslight` | rgba, slight | worth trying only on a sub-110 PPI panel at 1x |
 
-`native-hidpi fix --profile sharp`, etc.
+Choose with `native-hidpi fix --profile sharp`.
 
-## Other flags
+Which layer reaches which client, as far as I have verified:
+
+- **GSettings** (`org.gnome.desktop.interface`) reaches GNOME Shell, GTK3/GTK4, and Qt
+  when it uses the GTK platform theme (Ubuntu ships `qt6-gtk-platformtheme`), and snap
+  Firefox, which has the `gsettings` interface connected but cannot read dotfiles.
+- **fontconfig** (`~/.config/fontconfig/fonts.conf`) reaches Chrome/Chromium/Electron and
+  is how font discovery works for everything else. Blender and Java enumerate fonts
+  through fontconfig but apply antialiasing with their own internal flags, so fontconfig
+  may not change their UI text - neither is a reason to skip the file.
+- Neither reaches the Linux virtual console (no antialiasing at all; that needs a PSF
+  console font) or Wine/Proton titles (Wine's own font stack).
+
+Note on Ubuntu's defaults: Ubuntu overrides `font-antialiasing` to `rgba`, but *not*
+`font-hinting`, whose schema default is `slight`, and `font-rendering` stays `automatic`,
+where the toolkit applies its own heuristics. A machine showing `hinting=none` has it from
+local configuration, not from a distro default - `status` prints what you actually have.
+
+## Flags
+
+All of these belong to `fix`:
 
 ```
---scale 2                 force a framebuffer scale
---want-logical-width 1920 pick the largest integer scale that still fits this width
---no-fonts                display config only
---dry-run                 print what would change
-selftest                  exercise the detection logic, no display changes
+native-hidpi fix --scale 2                  force a framebuffer scale
+native-hidpi fix --want-logical-width 1920  keep at least this many logical px wide
+native-hidpi fix --profile sharp            antialiasing profile
+native-hidpi fix --no-fonts                 display config only
+native-hidpi fix --dry-run                  print what would change
 ```
+
+Other subcommands: `status`, `revert`, `selftest` (26 assertions on the decision logic,
+including a scratch `monitors.xml`; touches no display and no real config).
 
 ## Safety
 
-- The new mode is applied with `METHOD_VERIFY` first, and only persisted if verification
-  passes.
-- The previous mode, scale, GSettings values and `fonts.conf` are recorded before any
-  change, and `revert` restores them.
-- `fonts.conf` is parsed before it is written, then fontconfig is asked to load it; if it
-  rejects the file, the backup is restored and the tool exits. fontconfig drops the
-  **entire** file on a single syntax error and every client silently falls back to distro
-  defaults, so a malformed edit is invisible otherwise.
-- `status` reports a malformed `fonts.conf` as a warning and exits non-zero.
-- Refuses to run when Mutter reports no outputs (headless or monitor powered off) instead
-  of claiming everything is fine.
-- No root. Nothing outside `monitors.xml` (owned by GNOME), GSettings and
-  `~/.config/fontconfig/fonts.conf`.
+- Every connected output is included in each apply, so a second monitor is never disabled.
+- Cloned (mirrored) logical monitors keep all of their connectors.
+- One apply, then the result is read back; on mismatch the previous configuration is
+  re-applied and the tool exits non-zero. Read-back cannot prove the panel is actually
+  displaying an image - if it goes black, the previous configuration is what the tool
+  restored, and Settings -> Displays remains the way out.
+- `monitors.xml` is matched by connector **and serial**, backed up once, and is never
+  edited if it does not parse.
+- `fonts.conf` is parsed before writing and fontconfig is then asked to load it; errors
+  are attributed only to our own path, and the backup is restored if it is rejected.
+  fontconfig drops the **entire** file on one syntax error and every client silently falls
+  back to distro defaults - that failure is invisible unless you read the journal.
+- `state.json` and `monitors.xml`/`fonts.conf` writes are atomic.
+- `revert` keeps `state.json` when any step fails, so you can retry.
+- Refuses to run when Mutter reports no outputs (powered-off monitor, headless session)
+  rather than claiming success.
+- No root. Writes: `~/.config/monitors.xml` (+ `.native-hidpi.bak`),
+  `org.gnome.desktop.interface` GSettings, `~/.config/fontconfig/fonts.conf`
+  (+ `.native-hidpi.bak`), `~/.local/state/native-hidpi/state.json`.
 
 ## Requirements and limits
 
-- GNOME on Wayland. Needs `org.gnome.Mutter.DisplayConfig`; it exits with a clear
-  message on X11 or other desktops.
-- Multi-monitor: `fix` changes one mismatched output per run. Run it again for the next.
-- Applied configuration is persistent (`METHOD_PERSIST`), so it survives reboot.
-- No root needed.
-- Written and tested on Ubuntu 26.04, GNOME Shell / Mutter 50.1, single Dell U2720Q,
-  with Google Chrome 157 and snap Firefox. Other vendors' EDID quirks are untested; if
-  `is-preferred` is missing, `status` reports `native : unknown` and `fix` does nothing.
+- A GNOME session running Mutter; it needs `org.gnome.Mutter.DisplayConfig`. On non-GNOME
+  desktops it exits with a clear message. It will also *run* on GNOME on Xorg, but the
+  framebuffer-scale reasoning here is Wayland-specific, and on Xorg the mode is better set
+  with `xrandr`.
+- Multi-monitor: every output is included in the applied configuration; each run changes
+  the outputs that need it.
+- If a panel exposes no `is-preferred` mode, it is reported as `native : unknown` and left
+  alone.
+- Built-in (laptop) panels are labelled `[built-in]`. A built-in panel driven below its
+  native eDP mode is resampled too, so the warning applies there as well - it is just much
+  rarer than on external displays.
+- Written and tested on Ubuntu 26.04, GNOME Shell / Mutter 50.1, Dell U2720Q (single
+  output), Google Chrome 157, snap Firefox 160. Other vendors' EDID quirks are untested.
 
 ## Why this is a script and not a patch to Ubuntu
 
-The mode is per-machine state, and Ubuntu's `font-antialiasing=rgba` /
-`font-hinting=none` pair is GNOME's deliberate `automatic` policy for low-DPI displays,
-so neither is a bug anyone can merge. The gap that *is* worth closing is that the
-Displays panel will happily let you select a resolution far below the panel's native one
-with no warning - see [`UPSTREAM-ISSUE.md`](UPSTREAM-ISSUE.md) for that request.
+The mode is per-machine state, and Ubuntu's `font-antialiasing=rgba` default is a
+deliberate distribution choice, so neither is a bug anyone can merge. The gaps that *are*
+worth closing upstream are the missing warning in the Displays panel and the fact that a
+DBus persistent apply does not reliably land in `monitors.xml` - see
+[`UPSTREAM-ISSUE.md`](UPSTREAM-ISSUE.md).
 
 ## License
 

@@ -86,7 +86,7 @@ def session_type():
 
 def read_state():
     """(serial, logical_monitors). A logical monitor may mirror several connectors."""
-    serial, monitors, logical, props = bus_call("GetCurrentState", None, STATE_SIG)
+    serial, monitors, logical, _props = bus_call("GetCurrentState", None, STATE_SIG)
     out = []
     for lm in logical:
         x, y, scale, transform, primary, members, _ = lm
@@ -94,6 +94,7 @@ def read_state():
         specs = [(m[0], m[3]) for m in members]
         native = current = None
         scales = []
+        native_scales = []
         builtin = False
         for mon in monitors:
             if mon[0][0] not in connectors:
@@ -106,6 +107,7 @@ def read_state():
                     scales = list(supported)
                 if "is-preferred" in mode_props:
                     native = (mode_id, w, h, rate)
+                    native_scales = list(supported)
         out.append(
             {
                 "connectors": connectors,
@@ -119,6 +121,7 @@ def read_state():
                 "current": current,
                 "native": native,
                 "scales": scales,
+                "native_scales": native_scales,
                 "builtin": builtin,
             }
         )
@@ -166,7 +169,7 @@ def apply_changes(states, changes, dry=False):
         )
     for i, s in enumerate(fresh):
         if sorted(s["connectors"]) != sorted(states[i]["connectors"]):
-            raise RuntimeError(f"output set changed (hotplug?); nothing applied, re-run")
+            raise RuntimeError("output set changed (hotplug?); nothing applied, re-run")
     args = GLib.Variant(APPLY_SIG, (serial, METHOD_PERSIST, build_apply_list(fresh, changes), {}))
     bus_call("ApplyMonitorsConfig", args)
 
@@ -284,7 +287,11 @@ def fontconf_ok(path):
     in its message, so only attribute errors that mention ours."""
     if not shutil.which("fc-match"):
         return True, ""
-    err = subprocess.run(["fc-match", "sans-serif"], capture_output=True, text=True).stderr
+    env = None
+    if os.path.abspath(path) != os.path.abspath(FONTCONF):
+        env = dict(os.environ, FONTCONFIG_FILE=path)
+    err = subprocess.run(["fc-match", "sans-serif"], capture_output=True,
+                         text=True, env=env).stderr
     return (os.path.basename(path) not in err and path not in err), err.strip()
 
 
@@ -347,6 +354,28 @@ MONITORS_XML = os.path.join(
 MONITORS_XML_BACKUP = MONITORS_XML + ".native-hidpi.bak"
 
 
+def identity_of(s):
+    """(connector, serial) pairs of one logical monitor, mirrored ones included."""
+    return tuple(s.get("identity") or tuple(sorted((c, "") for c in s["connectors"])))
+
+
+def config_identity(states):
+    """A <configuration> block in monitors.xml is the *whole* set of connected monitors,
+    so a block is only comparable to the whole running set."""
+    return tuple(sorted(spec for s in states for spec in identity_of(s)))
+
+
+def mode_geometry(s, mode_id):
+    """(w, h, rate) of the mode we are about to store. Use the mode that is actually
+    being applied: an untouched output must keep its current mode, and with it its
+    refresh rate, instead of being rewritten with the native one."""
+    for src in (s.get("current"), s.get("native")):
+        if src and src[0] == mode_id:
+            return src[1], src[2], src[3]
+    fallback = s.get("native") or s.get("current")
+    return (fallback[1], fallback[2], fallback[3]) if fallback else (0, 0, 0.0)
+
+
 def read_monitors_xml():
     """Return the stored configurations as a list of dicts, or [] if there is no file.
     Raises ValueError if the file cannot be parsed."""
@@ -355,26 +384,37 @@ def read_monitors_xml():
     import xml.etree.ElementTree as ET
     try:
         root = ET.parse(MONITORS_XML).getroot()
-    except ET.ParseError as exc:
+    except (ET.ParseError, OSError) as exc:
         raise ValueError(f"{MONITORS_XML}: {exc}")
     out = []
     for cfg in root.findall("configuration"):
         monitors = []
         for lm in cfg.findall("logicalmonitor"):
-            spec = lm.find("monitor/monitorspec")
-            mode = lm.find("monitor/mode")
-            scale = lm.find("scale")
-            if spec is None or mode is None:
-                continue
-            monitors.append({
-                "element": lm,
-                "connector": spec.findtext("connector"),
-                "product": spec.findtext("product"),
-                "serial": spec.findtext("serial") or "",
-                "mode": (int(mode.findtext("width")), int(mode.findtext("height")),
-                         float(mode.findtext("rate"))),
-                "scale": float(scale.text) if scale is not None and scale.text else 1.0,
-            })
+            scale_node = lm.find("scale")
+            try:
+                scale = float(scale_node.text) \
+                    if scale_node is not None and scale_node.text else 1.0
+            except (ET.ParseError, TypeError, ValueError) as exc:
+                raise ValueError(f"{MONITORS_XML}: unreadable <scale>: {exc}")
+            for mon in lm.findall("monitor"):
+                spec = mon.find("monitorspec")
+                mode = mon.find("mode")
+                if spec is None or mode is None:
+                    continue
+                try:
+                    entry = {
+                        "element": lm,
+                        "monitor_element": mon,
+                        "connector": spec.findtext("connector"),
+                        "product": spec.findtext("product"),
+                        "serial": spec.findtext("serial") or "",
+                        "mode": (int(mode.findtext("width")), int(mode.findtext("height")),
+                                 float(mode.findtext("rate"))),
+                        "scale": scale,
+                    }
+                except (ET.ParseError, TypeError, ValueError) as exc:
+                    raise ValueError(f"{MONITORS_XML}: unreadable <mode>: {exc}")
+                monitors.append(entry)
         if monitors:
             out.append({"element": cfg, "monitors": monitors})
     return out
@@ -387,68 +427,80 @@ def persist_monitors_xml(states, changes):
     new one."""
     import xml.etree.ElementTree as ET
 
-    if os.path.exists(MONITORS_XML) and not os.path.exists(MONITORS_XML_BACKUP):
-        try:
-            shutil.copy2(MONITORS_XML, MONITORS_XML_BACKUP)
-        except OSError as exc:
-            return f"could not back up {MONITORS_XML}: {exc}"
-
     try:
         root = ET.parse(MONITORS_XML).getroot() if os.path.exists(MONITORS_XML) else \
             ET.Element("monitors", {"version": "2"})
     except ET.ParseError:
         return f"{MONITORS_XML} is malformed; refusing to edit it"
 
+    if os.path.exists(MONITORS_XML) and not os.path.exists(MONITORS_XML_BACKUP):
+        try:
+            shutil.copy2(MONITORS_XML, MONITORS_XML_BACKUP)
+        except OSError as exc:
+            return f"could not back up {MONITORS_XML}: {exc}"
+
     want = {}
     for i, s in enumerate(states):
-        s.setdefault("identity", tuple(sorted((c, "") for c in s["connectors"])))
         mode_id, scale = changes.get(i, (s["current"][0] if s["current"] else None, s["scale"]))
         if mode_id is None:
             continue
-        w, h = s["native"][1], s["native"][2]
-        rate = s["native"][3]
-        want[s["identity"]] = (w, h, rate, float(scale), s["primary"])
+        w, h, rate = mode_geometry(s, mode_id)
+        want[identity_of(s)] = (w, h, rate, float(scale), s["primary"])
+
+    full = config_identity(states)
 
     updated = 0
     for cfg in root.findall("configuration"):
         block_id = tuple(sorted(
-            (l.findtext("monitor/monitorspec/connector"),
-             l.findtext("monitor/monitorspec/serial") or "")
+            (mon.findtext("monitorspec/connector"),
+             mon.findtext("monitorspec/serial") or "")
             for l in cfg.findall("logicalmonitor")
+            for mon in l.findall("monitor")
         ))
-        if block_id not in want:
+        if block_id != full:
             continue
         for lm in cfg.findall("logicalmonitor"):
-            key = ((lm.findtext("monitor/monitorspec/connector"),
-                    lm.findtext("monitor/monitorspec/serial") or ""),)
-            i = next((k for k in want if set(k) == set(key)), None)
-            if i is None:
+            key = tuple(sorted(
+                (mon.findtext("monitorspec/connector"),
+                 mon.findtext("monitorspec/serial") or "")
+                for mon in lm.findall("monitor")
+            ))
+            entry = want.get(key)
+            if entry is None:
                 continue
-            w, h, rate, scale, _prim = want[i]
-            mode = lm.find("monitor/mode")
-            for tag, value in (("width", str(w)), ("height", str(h)), ("rate", f"{rate:.3f}")):
-                node = mode.find(tag)
-                if node is None:
-                    node = ET.SubElement(mode, tag)
-                node.text = value
+            w, h, rate, scale, _prim = entry
+            for mon in lm.findall("monitor"):
+                mode = mon.find("mode")
+                if mode is None:
+                    mode = ET.SubElement(mon, "mode")
+                for tag, value in (("width", str(w)), ("height", str(h)),
+                                   ("rate", f"{rate:.3f}")):
+                    node = mode.find(tag)
+                    if node is None:
+                        node = ET.SubElement(mode, tag)
+                    node.text = value
             scale_node = lm.find("scale")
             if scale_node is None:
                 scale_node = ET.SubElement(lm, "scale")
             scale_node.text = f"{scale:g}"
         updated += 1
 
-    if not updated:
+    if not updated and want:
         cfg = ET.SubElement(root, "configuration")
         ET.SubElement(cfg, "layoutmode").text = "logical"
-        for conns, (w, h, rate, scale, primary) in want.items():
-            for conn, _serial in conns:
-                lm = ET.SubElement(cfg, "logicalmonitor")
-                for tag in ("x", "y"):
-                    ET.SubElement(lm, tag).text = "0"
-                if primary:
-                    ET.SubElement(lm, "primary").text = "yes"
-                scale_node = ET.SubElement(lm, "scale")
-                scale_node.text = f"{scale:g}"
+        for s in states:
+            identity = identity_of(s)
+            entry = want.get(identity)
+            if entry is None:
+                continue
+            w, h, rate, scale, primary = entry
+            lm = ET.SubElement(cfg, "logicalmonitor")
+            ET.SubElement(lm, "x").text = str(s.get("x", 0))
+            ET.SubElement(lm, "y").text = str(s.get("y", 0))
+            ET.SubElement(lm, "scale").text = f"{scale:g}"
+            if primary:
+                ET.SubElement(lm, "primary").text = "yes"
+            for conn, _serial in identity:
                 mon = ET.SubElement(lm, "monitor")
                 spec = ET.SubElement(mon, "monitorspec")
                 for tag in ("connector", "vendor", "product", "serial"):
@@ -456,7 +508,8 @@ def persist_monitors_xml(states, changes):
                 spec.find("connector").text = conn
                 spec.find("serial").text = _serial
                 mode = ET.SubElement(mon, "mode")
-                for tag, value in (("width", str(w)), ("height", str(h)), ("rate", f"{rate:.3f}")):
+                for tag, value in (("width", str(w)), ("height", str(h)),
+                                   ("rate", f"{rate:.3f}")):
                     ET.SubElement(mode, tag).text = value
 
     try:
@@ -481,20 +534,31 @@ def stored_vs_running(states):
         stored = read_monitors_xml()
     except ValueError as exc:
         return [str(exc)]
+    full = config_identity(states)
     for cfg in stored:
-        conns = tuple(sorted(m["connector"] for m in cfg["monitors"]))
         block_id = tuple(sorted((m["connector"], m["serial"]) for m in cfg["monitors"]))
+        if block_id != full:
+            continue
+        by_lm = {}
+        for m in cfg["monitors"]:
+            by_lm.setdefault(id(m["element"]), []).append(m)
         for s in states:
-            if s.get("identity", tuple(sorted((c, "") for c in s["connectors"]))) != block_id \
-                    or s["current"] is None:
+            if s["current"] is None:
                 continue
-            for m in cfg["monitors"]:
-                if (m["mode"][0], m["mode"][1]) != (s["current"][1], s["current"][2]) or \
-                        abs(m["scale"] - s["scale"]) > 1e-6:
+            identity = identity_of(s)
+            for lms in by_lm.values():
+                if tuple(sorted((m["connector"], m["serial"]) for m in lms)) != identity:
+                    continue
+                bad = next((m for m in lms if (m["mode"][0], m["mode"][1]) !=
+                            (s["current"][1], s["current"][2])), None)
+                if bad is None and abs(lms[0]["scale"] - s["scale"]) > 1e-6:
+                    bad = lms[0]
+                if bad is not None:
                     notes.append(
-                        f"{','.join(conns)}: running {s['current'][1]}x{s['current'][2]} "
+                        f"{','.join(c for c, _ in identity)}: running "
+                        f"{s['current'][1]}x{s['current'][2]} "
                         f"scale {s['scale']} but {MONITORS_XML} stores "
-                        f"{m['mode'][0]}x{m['mode'][1]} scale {m['scale']} - the next "
+                        f"{bad['mode'][0]}x{bad['mode'][1]} scale {bad['scale']} - the next "
                         "hotplug or login will switch it back"
                     )
     return notes
@@ -524,10 +588,10 @@ def cmd_status(_args):
             px_em = pt / 72 * 96 * states[0]["scale"]
             print(f"\nUI font  {font.strip()}  -> {px_em:.1f} device px per em "
                   f"at scale {states[0]['scale']}")
-            print(f"antialiasing {gsettings_get('font-antialiasing')}   "
-                  f"hinting {gsettings_get('font-hinting')}")
         except (ValueError, IndexError):
-            pass
+            print(f"\nUI font  {font.strip()}  (no size set)")
+        print(f"antialiasing {gsettings_get('font-antialiasing')}   "
+              f"hinting {gsettings_get('font-hinting')}")
     broken = 0
     if os.path.exists(FONTCONF):
         ok, err = fontconf_ok(FONTCONF)
@@ -554,11 +618,17 @@ def plan_fix(states, forced_scale, want_logical_width):
         if m["native"] is None:
             skipped.append(",".join(m["connectors"]))
             continue
-        scale = forced_scale or best_integer_scale(m["native"], m["scales"], want_logical_width)
         needs_mode = resolution_problem(m["current"], m["native"])
+        # switching to native: the scales the *native* mode offers are the ones Mutter
+        # will accept; already native: keep the current mode, i.e. the user's refresh
+        # rate, and only change the scale.
+        target_mode = m["native"] if needs_mode else m["current"]
+        target_scales = (m.get("native_scales") or m["scales"]) if needs_mode else m["scales"]
+        scale = forced_scale or best_integer_scale(target_mode, target_scales,
+                                                   want_logical_width)
         needs_scale = abs(m["scale"] - scale) > 1e-6
         if needs_mode or needs_scale:
-            changes[i] = (m["native"][0], float(scale))
+            changes[i] = (target_mode[0], float(scale))
     return changes, skipped
 
 
@@ -571,11 +641,14 @@ def cmd_fix(args):
             "session is headless. Re-run with a monitor attached."
         )
     changes, skipped = plan_fix(states, args.scale, args.want_logical_width)
+    drift = stored_vs_running(states)
 
     if not changes:
         print("every output is already at native resolution with the chosen scale")
         if skipped:
             print(f"  (no native mode reported for: {', '.join(skipped)} - left alone)")
+        for note in drift:
+            print("NOTE     " + note)
     else:
         for i, (mode_id, scale) in changes.items():
             m = states[i]
@@ -584,7 +657,8 @@ def cmd_fix(args):
         print(f"(untouched outputs: {len(states) - len(changes)})")
 
     if args.dry_run:
-        print(f"would persist to {MONITORS_XML} (backup {MONITORS_XML_BACKUP})")
+        if changes or drift:
+            print(f"would persist to {MONITORS_XML} (backup {MONITORS_XML_BACKUP})")
         if not args.no_fonts:
             rgba, hintstyle, _ga, _gh = PROFILES[args.profile]
             print(f"would write {FONTCONF} (rgba={rgba}, hintstyle={hintstyle})")
@@ -594,7 +668,8 @@ def cmd_fix(args):
         prev = load_state()
         if "display" not in prev:
             prev["display"] = [
-                {"connectors": s["connectors"], "mode": s["current"][0], "scale": s["scale"]}
+                {"connectors": s["connectors"], "specs": s.get("specs", []),
+                 "mode": s["current"][0], "scale": s["scale"]}
                 for s in states if s["current"]
             ]
             save_state(prev)
@@ -622,24 +697,36 @@ def cmd_fix(args):
         for i, (mode_id, scale) in changes.items():
             print(f"applied {','.join(states[i]['connectors'])}: {mode_id} scale {scale} "
                   "(read back and confirmed)")
+
+    # nothing to apply live, but the stored file still disagrees with what is running,
+    # and that is what a hotplug or the next login would restore.
+    if changes or drift:
+        existed = os.path.exists(MONITORS_XML)
         err = persist_monitors_xml(states, changes)
         if err:
             print(f"WARNING  {err}")
-            print("  the live change is in effect, but the next hotplug or login will undo it")
+            print("  " + ("the live change is in effect, but the next hotplug or login "
+                          "will undo it" if changes else
+                          "nothing live needed changing, but the stored file is what the "
+                          "next hotplug or login will restore"))
         else:
+            prev = load_state()
+            if "monitors_xml_existed" not in prev:
+                prev["monitors_xml_existed"] = existed
+                save_state(prev)
             print(f"persisted to {MONITORS_XML} (backup at {MONITORS_XML_BACKUP})")
 
     if not args.no_fonts:
         rgba, hintstyle, gnome_aa, gnome_hint = PROFILES[args.profile]
-        if args.dry_run:
-            print(f"would write {FONTCONF} (rgba={rgba}, hintstyle={hintstyle})")
-            return 0
         prev = load_state()
         if "interface" not in prev:
             prev["interface"] = {k: gsettings_get(k) for k in UI_FONT_KEYS}
-        if os.path.exists(FONTCONF) and "fontconf" not in prev:
-            with open(FONTCONF) as fh:
-                prev["fontconf"] = fh.read()
+        if "fontconf" not in prev:
+            if os.path.exists(FONTCONF):
+                with open(FONTCONF) as fh:
+                    prev["fontconf"] = fh.read()
+            else:
+                prev["fontconf"] = None
         save_state(prev)
         write_fontconf(rgba, hintstyle)
         gsettings_op("set", "font-rendering", "manual")
@@ -658,38 +745,64 @@ def cmd_revert(_args):
         return 1
     failed = []
 
-    if prev.get("display") and have_display_config():
-        _serial, states = read_state()
-        changes = {}
-        for saved in prev["display"]:
-            want_specs = saved.get("specs")
-            for i, s in enumerate(states):
-                here = [tuple(c) for c in s.get("specs", [])]
-                if want_specs:
-                    matched = sorted(here) == sorted(tuple(c) for c in want_specs)
-                else:  # state recorded before serials were tracked
-                    matched = sorted(s["connectors"]) == sorted(saved["connectors"])
-                if matched:
-                    changes[i] = (saved["mode"], saved["scale"])
-        if len(changes) != len(states):
-            print("note: the connected output set no longer matches what was recorded; "
-                  "restoring only the outputs that are present")
-        try:
-            apply_changes(states, changes)
-            print("restored " + ", ".join(
-                f"{','.join(s['connectors'])}={changes[i][0]}@{changes[i][1]}"
-                for i, s in enumerate(states) if i in changes))
-        except (GLib.Error, RuntimeError) as exc:
+    if prev.get("display"):
+        if not have_display_config():
             failed.append("display")
-            print(f"could not restore the display configuration: {exc}")
+            print("cannot restore the display configuration: Mutter's DisplayConfig is not "
+                  "available in this session; Settings -> Displays is the way back")
+        else:
+            _serial, states = read_state()
+            changes = {}
+            for saved in prev["display"]:
+                want_specs = saved.get("specs")
+                for i, s in enumerate(states):
+                    here = [tuple(c) for c in s.get("specs", [])]
+                    if want_specs:
+                        matched = sorted(here) == sorted(tuple(c) for c in want_specs)
+                    else:  # state recorded before serials were tracked
+                        matched = sorted(s["connectors"]) == sorted(saved["connectors"])
+                    if matched:
+                        changes[i] = (saved["mode"], saved["scale"])
+            if len(changes) != len(states):
+                print("note: the connected output set no longer matches what was recorded; "
+                      "restoring only the outputs that are present")
+            if not states or not changes:
+                failed.append("display")
+                print("could not restore the display configuration: none of the recorded "
+                      f"outputs are connected ({len(states)} reported); leaving "
+                      f"{STATE_FILE} in place")
+            else:
+                try:
+                    apply_changes(states, changes)
+                    ok, bad = verify_applied(changes)
+                    if not ok:
+                        failed.append("display")
+                        print("the restored display configuration did not read back:")
+                        for line in bad:
+                            print("  " + line)
+                    else:
+                        print("restored " + ", ".join(
+                            f"{','.join(s['connectors'])}={changes[i][0]}@{changes[i][1]}"
+                            for i, s in enumerate(states) if i in changes))
+                except (GLib.Error, RuntimeError) as exc:
+                    failed.append("display")
+                    print(f"could not restore the display configuration: {exc}")
 
     if os.path.exists(MONITORS_XML_BACKUP):
         try:
             shutil.copy2(MONITORS_XML_BACKUP, MONITORS_XML)
+            os.remove(MONITORS_XML_BACKUP)
             print(f"restored {MONITORS_XML} from {MONITORS_XML_BACKUP}")
         except OSError as exc:
             failed.append("monitors.xml")
             print(f"could not restore {MONITORS_XML}: {exc}")
+    elif not prev.get("monitors_xml_existed", True) and os.path.exists(MONITORS_XML):
+        try:
+            os.remove(MONITORS_XML)
+            print(f"removed {MONITORS_XML} (there was none before)")
+        except OSError as exc:
+            failed.append("monitors.xml")
+            print(f"could not remove {MONITORS_XML}: {exc}")
 
     if prev.get("interface"):
         for key, value in prev["interface"].items():
@@ -711,6 +824,8 @@ def cmd_revert(_args):
                     fh.write(prev["fontconf"])
                 os.replace(tmp, FONTCONF)
                 print(f"restored {FONTCONF}")
+            if os.path.exists(FONTCONF_BACKUP):
+                os.remove(FONTCONF_BACKUP)
         except OSError as exc:
             failed.append("fontconfig")
             print(f"could not restore {FONTCONF}: {exc}")
@@ -754,6 +869,55 @@ def cmd_selftest(_args):
         "native": ("3840x2160@59.997", 3840, 2160, 59.997), "scales": [1.0, 2.0],
         "builtin": False,
     }
+    # the current mode is 1080p and only offers 1x; the preferred (native) mode offers 2x
+    low_res_scaled = {
+        "connectors": ["DP-5"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
+        "primary": True, "current": ("1920x1080@60", 1920, 1080, 60.0),
+        "native": ("3840x2160@59.997", 3840, 2160, 59.997),
+        "scales": [1.0], "native_scales": [1.0, 1.5, 2.0], "builtin": False,
+    }
+    no_native = {  # untouched output without a preferred mode must not break the write
+        "connectors": ["DP-6"], "x": 3840, "y": 0, "scale": 1.0, "transform": 0,
+        "primary": False, "current": ("1920x1200@59.95", 1920, 1200, 59.95),
+        "native": None, "scales": [1.0], "builtin": False,
+    }
+
+    def cfg_xml(lms):
+        return ('  <configuration>\n    <layoutmode>logical</layoutmode>\n' + lms
+                + '  </configuration>\n')
+
+    def doc(*cfgs):
+        return '<monitors version="2">\n' + ''.join(cfgs) + '</monitors>\n'
+
+    def mon_xml(conn, serial, vendor, product, w, h, rate):
+        return (f'      <monitor>\n        <monitorspec>\n'
+                f'          <connector>{conn}</connector>\n          <vendor>{vendor}</vendor>\n'
+                f'          <product>{product}</product>\n          <serial>{serial}</serial>\n'
+                f'        </monitorspec>\n        <mode>\n          <width>{w}</width>\n'
+                f'          <height>{h}</height>\n          <rate>{rate}</rate>\n'
+                f'        </mode>\n      </monitor>\n')
+
+    def lm_xml(x, y, scale, monitors, primary=False):
+        return (f'    <logicalmonitor>\n      <x>{x}</x>\n      <y>{y}</y>\n'
+                f'      <scale>{scale}</scale>\n'
+                + ('      <primary>yes</primary>\n' if primary else '')
+                + monitors + '    </logicalmonitor>\n')
+
+    SINGLE_LM = lm_xml(0, 0, "1.5", mon_xml("DP-1", "X", "DEL", "DELL U2720Q",
+                                            3840, 2160, "59.997"), primary=True)
+    OTHER_LM = lm_xml(1920, 0, "1.0", mon_xml("DP-2", "Y", "SAM", "SyncMaster",
+                                              2560, 1440, "59.951"))
+    STALE_LM = lm_xml(0, 0, "1.0", mon_xml("DP-1", "Z", "DEL", "DELL U2415",
+                                           1920, 1080, "60.000"))
+    # a cloned pair is a single <logicalmonitor> holding two <monitor> elements
+    MIRROR_LM = lm_xml(0, 0, "1.0",
+                       mon_xml("eDP-1", "L", "BOE", "0x095D", 2880, 1800, "60.000")
+                       + mon_xml("DP-3", "M", "DEL", "U2720Q", 2880, 1800, "60.000"),
+                       primary=True)
+    SINGLE = doc(cfg_xml(SINGLE_LM))
+    DUAL = doc(cfg_xml(SINGLE_LM + OTHER_LM), cfg_xml(STALE_LM))
+    MIRROR = doc(cfg_xml(MIRROR_LM))
+
     # monitors.xml persistence, exercised against a scratch copy of the real format
     import tempfile
     global MONITORS_XML, MONITORS_XML_BACKUP
@@ -763,17 +927,7 @@ def cmd_selftest(_args):
         MONITORS_XML = os.path.join(td, "monitors.xml")
         MONITORS_XML_BACKUP = MONITORS_XML + ".bak"
         with open(MONITORS_XML, "w") as fh:
-            fh.write(
-                '<monitors version="2">\n  <configuration>\n'
-                '    <layoutmode>logical</layoutmode>\n    <logicalmonitor>\n'
-                '      <x>0</x>\n      <y>0</y>\n      <scale>1.5</scale>\n'
-                '      <primary>yes</primary>\n      <monitor>\n        <monitorspec>\n'
-                '          <connector>DP-1</connector>\n          <vendor>DEL</vendor>\n'
-                '          <product>DELL U2720Q</product>\n          <serial>X</serial>\n'
-                '        </monitorspec>\n        <mode>\n          <width>3840</width>\n'
-                '          <height>2160</height>\n          <rate>59.997</rate>\n'
-                '        </mode>\n      </monitor>\n    </logicalmonitor>\n'
-                '  </configuration>\n</monitors>\n')
+            fh.write(SINGLE)
         running = dict(fake[0], current=("3840x2160@59.997", 3840, 2160, 59.997), scale=1.5,
                        specs=[("DP-1", "X")], identity=(("DP-1", "X"),))
         parsed = read_monitors_xml()
@@ -790,10 +944,72 @@ def cmd_selftest(_args):
             [dict(fake[1], connectors=["DP-9"], specs=[("DP-9", "Y")],
                   identity=(("DP-9", "Y"),), primary=False)],
             {0: ("3840x2160@59.997", 2.0)})
-        txt = open(MONITORS_XML).read()
+        with open(MONITORS_XML) as fh:
+            txt = fh.read()
         r["unknown_output_appended"] = other is None and "DP-9" in txt
         r["other_monitor_block_untouched"] = "<serial>X</serial>" in txt \
             and txt.count("<configuration>") == 2
+
+        # two monitors running: the <configuration> that holds both is the one to update,
+        # and the single-monitor block for a different panel has to stay as it was
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(DUAL)
+        dual_a = dict(running)
+        dual_b = dict(fake[1], current=("2560x1440@59.951", 2560, 1440, 59.951), scale=1.0,
+                      specs=[("DP-2", "Y")], identity=(("DP-2", "Y"),))
+        dual = [dual_a, dual_b]
+        r["dual_parsed"] = len(read_monitors_xml()) == 2
+        r["dual_match_ok"] = stored_vs_running(dual) == []
+        r["dual_stale_detected"] = len(stored_vs_running([dict(dual_a, scale=2.0),
+                                                         dual_b])) == 1
+        err = persist_monitors_xml(dual, {0: ("3840x2160@59.997", 2.0)})
+        r["dual_persist_ok"] = err is None
+        blocks = {tuple(sorted((m["connector"], m["serial"]) for m in c["monitors"])): c
+                  for c in read_monitors_xml()}
+        pair = blocks.get((("DP-1", "X"), ("DP-2", "Y")))
+        lone = blocks.get((("DP-1", "Z"),))
+        r["dual_scale_rewritten"] = bool(pair) and \
+            [m["scale"] for m in pair["monitors"] if m["connector"] == "DP-1"] == [2.0]
+        r["dual_untouched_keeps_current_mode"] = bool(pair) and \
+            [m["mode"] for m in pair["monitors"] if m["connector"] == "DP-2"] == \
+            [(2560, 1440, 59.951)]
+        r["dual_other_block_untouched"] = bool(lone) and lone["monitors"][0]["mode"] == \
+            (1920, 1080, 60.0) and lone["monitors"][0]["scale"] == 1.0
+        r["dual_block_count"] = len(blocks) == 2
+        r["dual_stale_gone"] = stored_vs_running([dict(dual_a, scale=2.0), dual_b]) == []
+
+        # a mirrored pair is one <logicalmonitor> with two <monitor> elements
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(MIRROR)
+        cloned = dict(mirror, specs=[("eDP-1", "L"), ("DP-3", "M")],
+                      identity=(("DP-3", "M"), ("eDP-1", "L")))
+        parsed = read_monitors_xml()
+        r["mirrored_both_monitors_parsed"] = len(parsed) == 1 and \
+            len(parsed[0]["monitors"]) == 2
+        r["mirrored_stale_detected"] = len(stored_vs_running([dict(cloned, scale=2.0)])) == 1
+        err = persist_monitors_xml([cloned], {0: ("2880x1800@60", 2.0)})
+        with open(MONITORS_XML) as fh:
+            txt = fh.read()
+        r["mirrored_persist_ok"] = err is None and txt.count("<logicalmonitor>") == 1 and \
+            all(m["scale"] == 2.0 for m in read_monitors_xml()[0]["monitors"])
+
+        # an untouched output with native=None must not crash, and the block that gets
+        # appended must keep the real layout instead of stacking everything at 0,0
+        with open(MONITORS_XML, "w") as fh:
+            fh.write(SINGLE)
+        err = persist_monitors_xml([running, no_native], {})
+        with open(MONITORS_XML) as fh:
+            txt = fh.read()
+        blocks = {tuple(sorted((m["connector"], m["serial"]) for m in c["monitors"])): c
+                  for c in read_monitors_xml()}
+        added = blocks.get((("DP-1", "X"), ("DP-6", "")))
+        r["untouched_without_native_persisted"] = err is None and bool(added)
+        r["appended_block_keeps_layout"] = bool(added) and "<x>3840</x>" in txt and \
+            [m["mode"] for m in added["monitors"] if m["connector"] == "DP-6"] == \
+            [(1920, 1200, 59.95)]
+        r["appended_block_keeps_running_scale"] = bool(added) and \
+            [m["scale"] for m in added["monitors"] if m["connector"] == "DP-1"] == [1.5]
+
         with open(MONITORS_XML, "w") as fh:
             fh.write("<monitors version='2'><configuration>")
         r["malformed_detected"] = False
@@ -803,6 +1019,17 @@ def cmd_selftest(_args):
             r["malformed_detected"] = True
         r["malformed_not_edited"] = persist_monitors_xml(
             [running], {0: ("3840x2160@59.997", 2.0)}) is not None
+
+        # a scratch fonts.conf has to be validated as itself, not against ~/.config
+        good_fonts = os.path.join(td, "fonts-good.conf")
+        bad_fonts = os.path.join(td, "fonts-bad.conf")
+        with open(good_fonts, "w") as fh:
+            fh.write(fontconf_body(*PROFILES["mac"][:2]))
+        with open(bad_fonts, "w") as fh:
+            fh.write('<fontconfig>\n  <match target="font"\n')
+        have_fc = bool(shutil.which("fc-match"))
+        r["fontconf_scratch_valid"] = (not have_fc) or fontconf_ok(good_fonts)[0]
+        r["fontconf_scratch_malformed"] = (not have_fc) or (not fontconf_ok(bad_fonts)[0])
     MONITORS_XML, MONITORS_XML_BACKUP = _real_xml, _real_bak
 
     checks = [
@@ -831,6 +1058,10 @@ def cmd_selftest(_args):
          [("eDP-1", "2880x1800@60", {}), ("DP-3", "2880x1800@60", {})]),
         ("built-in flagged in the warning", "built-in" in find_problems([
             dict(mirror, current=("1920x1200@60", 1920, 1200, 60.0))])[0]),
+        ("plan uses the native mode's scales",
+         plan_fix([low_res_scaled], None, 1920)[0] == {0: ("3840x2160@59.997", 2.0)}),
+        ("plan keeps the current refresh rate",
+         plan_fix([stale], None, 1920)[0] == {0: ("3840x2160@29.562", 2.0)}),
         ("stored monitors.xml parsed", r["parsed"]),
         ("running match produces no note", r["match_ok"]),
         ("stored-vs-running mismatch detected", r["stale_detected"]),
@@ -841,8 +1072,31 @@ def cmd_selftest(_args):
         ("unmatched output gets a new block", r["unknown_output_appended"]),
         ("same connector, different serial: other block untouched",
          r["other_monitor_block_untouched"]),
+        ("dual-monitor file parsed", r["dual_parsed"]),
+        ("dual-monitor match produces no note", r["dual_match_ok"]),
+        ("dual-monitor mismatch detected", r["dual_stale_detected"]),
+        ("dual-monitor persist reports success", r["dual_persist_ok"]),
+        ("dual-monitor scale rewritten", r["dual_scale_rewritten"]),
+        ("untouched output keeps its current mode, not the native one",
+         r["dual_untouched_keeps_current_mode"]),
+        ("single-monitor block untouched by a dual-monitor write",
+         r["dual_other_block_untouched"]),
+        ("persist neither merged nor dropped a block", r["dual_block_count"]),
+        ("dual-monitor mismatch gone after persist", r["dual_stale_gone"]),
+        ("mirrored logical monitor parsed as two monitors",
+         r["mirrored_both_monitors_parsed"]),
+        ("mirrored pair mismatch detected once", r["mirrored_stale_detected"]),
+        ("mirrored pair stored in one logical monitor", r["mirrored_persist_ok"]),
+        ("untouched output without a native mode persisted",
+         r["untouched_without_native_persisted"]),
+        ("appended block keeps each output's real position and mode",
+         r["appended_block_keeps_layout"]),
+        ("appended block keeps an untouched output's scale",
+         r["appended_block_keeps_running_scale"]),
         ("malformed monitors.xml detected", r["malformed_detected"]),
         ("malformed monitors.xml refused, not edited", r["malformed_not_edited"]),
+        ("valid scratch fonts.conf accepted", r["fontconf_scratch_valid"]),
+        ("malformed scratch fonts.conf rejected", r["fontconf_scratch_malformed"]),
         ("user fonts.conf parses (if present)",
          (not os.path.exists(FONTCONF)) or fontconf_ok(FONTCONF)[0]),
     ]

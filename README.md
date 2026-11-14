@@ -48,6 +48,12 @@ names are reused between monitors, and a real config file on the author's machin
 different panels both called `DP-1`. Blocks for other monitors or other layouts are left
 alone, and the original file is backed up.
 
+A `<configuration>` block is the *whole* set of connected monitors (one `<logicalmonitor>`
+each, or several `<monitor>` elements in one for a mirrored pair), so a block is only a
+candidate when its full connector+serial set is what is running: with two panels attached
+`fix` updates the two-monitor block and leaves the one for the single-monitor layout as it
+was, not the other way round.
+
 `status` reports the mismatch when it appears:
 
 ```
@@ -72,7 +78,8 @@ wrote ~/.config/fontconfig/fonts.conf and set antialiasing=grayscale, hinting=sl
 2. Reads the result back and, if it did not take, re-applies the previous configuration.
    Mutter documents the `method` flags inconsistently between versions, so this tool does
    not rely on a "verify" flag: it applies once and checks the outcome.
-3. Persists to `monitors.xml`.
+3. Persists to `monitors.xml` - including the case where nothing live needed changing but
+   the stored file disagrees with what is running, which is what `status` warns about.
 4. Installs an antialiasing profile in GSettings *and* `~/.config/fontconfig/fonts.conf`.
 
 Browsers read fontconfig once at startup, so restart them.
@@ -152,7 +159,7 @@ native-hidpi fix --no-fonts                 display config only
 native-hidpi fix --dry-run                  print what would change
 ```
 
-Other subcommands: `status`, `revert`, `selftest` (26 assertions on the decision logic,
+Other subcommands: `status`, `revert`, `selftest` (46 assertions on the decision logic,
 including a scratch `monitors.xml`; touches no display and no real config).
 
 ## Safety
@@ -165,6 +172,10 @@ including a scratch `monitors.xml`; touches no display and no real config).
   restored, and Settings -> Displays remains the way out.
 - `monitors.xml` is matched by connector **and serial**, backed up once, and is never
   edited if it does not parse.
+- An output that needs no change keeps the mode it is on, refresh rate included: fixing
+  the scale on a 4K panel already running 4K@30 does not silently move it to 4K@60.
+- What `revert` restores is recorded per connector **and serial**, and is read back to
+  confirm it took; if a step fails the failure is named and `state.json` is kept.
 - `fonts.conf` is parsed before writing and fontconfig is then asked to load it; errors
   are attributed only to our own path, and the backup is restored if it is rejected.
   fontconfig drops the **entire** file on one syntax error and every client silently falls

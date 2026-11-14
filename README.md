@@ -104,9 +104,43 @@ so read it with care.
 Fractional scales are float32 values, not decimal ones: between 1.5 and 2.0 on a 4K panel
 Mutter offers `1.6666666269302368` (5/3), because 3840/1.75 is not an integer. So `--scale`
 snaps to the closest scale the mode actually offers (`--scale 1.67` → 5/3, `--scale 1.33`
-→ 4/3) and refuses one that is further out (`--scale 1.75`) rather than send something
-Mutter will round behind your back. The same value goes into `monitors.xml`: writing
-`1.66667` there is a *different* scale, and `status` would report drift that is not real.
+→ 4/3). The same value goes into `monitors.xml`: writing `1.66667` there is a *different*
+scale, and `status` would report drift that is not real.
+
+## Want 1.8x? Keep the pixel grid, scale the text
+
+An in-between request is not a framebuffer step at all, so `fix` builds it out of the two
+things that are: the **pixel-exact integer framebuffer scale**, and
+`text-scaling-factor` to bring the text back down to the size you asked for.
+
+```
+$ native-hidpi fix --scale 1.8
+planned DP-1: 3840x2160@59.997 scale 1.6666666269302368 -> 3840x2160@59.997 scale 2.0
+note: scale 1.8 is not a framebuffer step this mode offers; using pixel-exact scale 2
+      + text-scaling-factor 0.9 (effective 1.8x)
+```
+
+| request | framebuffer | text-scaling-factor | what happens |
+|---|---|---|---|
+| `--scale 2` | 2x | 1.0 | one logical pixel = four device pixels, exact |
+| `--scale 1.8` | 2x | 0.9 | exact grid, text 10% smaller |
+| `--scale 1.75` | 2x | 0.875 | exact grid, text 12.5% smaller |
+| `--scale 1.67` | 5/3 | 1.0 | resampled in the GPU - the soft option |
+
+`status` prints both halves:
+
+```
+UI font  'Ubuntu Sans 11'  -> 26.4 device px per em at scale 2.0
+         x text-scaling-factor 0.9 (effective 1.8x)
+```
+
+Set the halves yourself with `native-hidpi fix --scale 2 --text-scale 0.9`, or only the text
+with `--text-scale`. The honest caveat: the layout grid stays at the integer scale (1920x1080
+logical at 2x on a 4K panel) and `text-scaling-factor` only resizes **text** - icons and
+widgets sized in pixels keep their 2x size. It is still the better trade, because nothing is
+interpolated. A request no integer scale in the mode can carry (`--scale 5`, or `--scale
+1.75` on a panel whose steps stop at 5/3) is refused rather than quietly rounded, and
+`revert` puts the old `text-scaling-factor` back.
 
 Chrome is the client people notice. The Chrome 157 build tested here binds `wp_viewport`
 and contains **no** `zwp_fractional_scale` symbols, i.e. it does not appear to implement
@@ -161,13 +195,15 @@ All of these belong to `fix`:
 ```
 native-hidpi fix --scale 2                  force a framebuffer scale (snapped to the
                                             closest scale the mode actually offers)
+native-hidpi fix --scale 1.8                pixel-exact integer scale + text-scaling-factor
+native-hidpi fix --text-scale 0.9           set text-scaling-factor (e.g. 0.9 at 2x)
 native-hidpi fix --want-logical-width 1920  keep at least this many logical px wide
 native-hidpi fix --profile sharp            antialiasing profile
 native-hidpi fix --no-fonts                 display config only
 native-hidpi fix --dry-run                  print what would change
 ```
 
-Other subcommands: `status`, `revert`, `selftest` (52 assertions on the decision logic,
+Other subcommands: `status`, `revert`, `selftest` (57 assertions on the decision logic,
 including a scratch `monitors.xml`; touches no display and no real config).
 
 ## Safety
@@ -190,6 +226,8 @@ including a scratch `monitors.xml`; touches no display and no real config).
   are attributed only to our own path, and the backup is restored if it is rejected.
   fontconfig drops the **entire** file on one syntax error and every client silently falls
   back to distro defaults - that failure is invisible unless you read the journal.
+- `text-scaling-factor` is recorded in `state.json` before it is touched (including the
+  value synthesized for an in-between `--scale`) and put back by `revert`.
 - `state.json` and `monitors.xml`/`fonts.conf` writes are atomic.
 - `revert` keeps `state.json` when any step fails, so you can retry.
 - Refuses to run when Mutter reports no outputs (powered-off monitor, headless session)

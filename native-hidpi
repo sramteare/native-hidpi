@@ -10,6 +10,7 @@ the resolution just "looks a bit blurry".
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -149,19 +150,40 @@ def best_integer_scale(native, scales, want_logical_width=1920):
     return max(offered) if offered else 1.0
 
 
-def resolve_scale(forced_scale, scales):
-    """Snap --scale onto a scale the mode really offers. Mutter's fractional steps are
-    float32 values (5/3 = 1.6666666269302368), so '1.67' has to become that exact value
-    rather than be sent as-is and rejected or silently rounded."""
+def resolve_scale_and_text(forced_scale, scales):
+    """(display scale, text-scaling-factor) for a requested overall scale.
+
+    Mutter's fractional steps are float32 values (5/3 = 1.6666666269302368), so a request
+    like 1.8 is not a framebuffer scale at all - 3840/1.8 is not an integer. The crisp way
+    to get an 1.8x desktop is the pixel-exact integer scale 2 plus text-scaling-factor 0.9,
+    which is exactly what GNOME's own fractional scaling is approximating here.
+    """
+    if forced_scale is None:
+        return None, 1.0
+    wanted = float(forced_scale)
     offered = [float(s) for s in scales or []]
     if not offered:
-        return float(forced_scale)
-    closest = min(offered, key=lambda s: abs(s - float(forced_scale)))
-    if abs(closest - float(forced_scale)) <= 0.02:
-        return float(closest)
+        return wanted, 1.0
+    closest = min(offered, key=lambda s: abs(s - wanted))
+    if abs(closest - wanted) <= 0.02:
+        return float(closest), 1.0
+    ceil_s = float(math.ceil(wanted))
+    pairing = [s for s in offered
+               if float(s).is_integer() and s >= 2 and 0.5 <= wanted / s <= 1.5]
+    if ceil_s in offered and ceil_s in pairing:
+        return ceil_s, round(wanted / ceil_s, 4)
+    above = sorted(s for s in pairing if s >= wanted)
+    if above:
+        return above[0], round(wanted / above[0], 4)
     raise ValueError(
-        f"scale {forced_scale} is not offered by this mode; the closest available is "
-        f"{closest} (supported: {', '.join(str(s) for s in offered)})")
+        f"scale {wanted} is not offered by this mode and no integer scale in it can carry "
+        f"it as scale + text-scaling-factor; the closest available is {closest} "
+        f"(supported: {', '.join(str(s) for s in offered)})")
+
+
+def resolve_scale(forced_scale, scales):
+    """The display-scale half of resolve_scale_and_text()."""
+    return resolve_scale_and_text(forced_scale, scales)[0]
 
 
 def build_apply_list(states, changes):
@@ -282,6 +304,16 @@ def gsettings_op(op, key, value=None):
     if op == "set":
         argv.append(value)
     return subprocess.run(argv, capture_output=True).returncode == 0
+
+
+def gsettings_float(key, default=1.0):
+    raw = gsettings_get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip().strip("'"))
+    except ValueError:
+        return default
 
 
 def fontconf_body(rgba, hintstyle):
@@ -609,13 +641,17 @@ def cmd_status(_args):
             "session is headless. Re-run with a monitor attached."
         )
     problems = report(states)
+    text_scale = gsettings_float("text-scaling-factor")
     font = gsettings_get("font-name")
     if font is not None:
         try:
             pt = float(font.strip("'").rsplit(" ", 1)[1])
-            px_em = pt / 72 * 96 * states[0]["scale"]
+            px_em = pt / 72 * 96 * states[0]["scale"] * text_scale
+            extra = (f" x text-scaling-factor {text_scale:g} "
+                     f"(effective {states[0]['scale'] * text_scale:g}x)"
+                     if abs(text_scale - 1.0) > 1e-4 else "")
             print(f"\nUI font  {font.strip()}  -> {px_em:.1f} device px per em "
-                  f"at scale {states[0]['scale']}")
+                  f"at scale {states[0]['scale']}{extra}")
         except (ValueError, IndexError):
             print(f"\nUI font  {font.strip()}  (no size set)")
         print(f"antialiasing {gsettings_get('font-antialiasing')}   "
@@ -652,7 +688,7 @@ def plan_fix(states, forced_scale, want_logical_width):
         # rate, and only change the scale.
         target_mode = m["native"] if needs_mode else m["current"]
         target_scales = (m.get("native_scales") or m["scales"]) if needs_mode else m["scales"]
-        scale = (resolve_scale(forced_scale, target_scales) if forced_scale
+        scale = (resolve_scale_and_text(forced_scale, target_scales)[0] if forced_scale
                  else best_integer_scale(target_mode, target_scales, want_logical_width))
         needs_scale = abs(m["scale"] - scale) > SCALE_TOL
         if needs_mode or needs_scale:
@@ -674,6 +710,29 @@ def cmd_fix(args):
         sys.exit(str(exc))
     drift = stored_vs_running(states)
 
+    # text-scaling-factor: asked for directly, or synthesized because the requested
+    # overall scale is not a step any mode offers (1.8 -> pixel-exact 2x + text 0.9)
+    target_text_scale = 1.0
+    pairing = None
+    if args.text_scale is not None:
+        if not 0.5 <= float(args.text_scale) <= 3.0:
+            sys.exit(f"--text-scale must be between 0.5 and 3.0 (got {args.text_scale})")
+        target_text_scale = float(args.text_scale)
+    elif args.scale is not None:
+        try:
+            for m in states:
+                if m["current"] is None or m["native"] is None:
+                    continue
+                needs_mode = resolution_problem(m["current"], m["native"])
+                target_scales = ((m.get("native_scales") or m["scales"]) if needs_mode
+                                 else m["scales"])
+                int_s, text_s = resolve_scale_and_text(args.scale, target_scales)
+                if abs(text_s - 1.0) > 1e-4:
+                    target_text_scale, pairing = text_s, (int_s, text_s)
+                break
+        except ValueError as exc:
+            sys.exit(str(exc))
+
     if not changes:
         print("every output is already at native resolution with the chosen scale")
         if skipped:
@@ -686,10 +745,16 @@ def cmd_fix(args):
             print(f"planned {','.join(m['connectors'])}: "
                   f"{m['current'][0]} scale {m['scale']} -> {mode_id} scale {scale}")
         print(f"(untouched outputs: {len(states) - len(changes)})")
+    if pairing:
+        print(f"note: scale {args.scale:g} is not a framebuffer step this mode offers; "
+              f"using pixel-exact scale {pairing[0]:g} + text-scaling-factor "
+              f"{pairing[1]:g} (effective {args.scale:g}x)")
 
     if args.dry_run:
         if changes or drift:
             print(f"would persist to {MONITORS_XML} (backup {MONITORS_XML_BACKUP})")
+        if args.text_scale is not None or abs(target_text_scale - 1.0) > 1e-4:
+            print(f"would set text-scaling-factor={target_text_scale:g}")
         if not args.no_fonts:
             rgba, hintstyle, _ga, _gh = PROFILES[args.profile]
             print(f"would write {FONTCONF} (rgba={rgba}, hintstyle={hintstyle})")
@@ -746,6 +811,19 @@ def cmd_fix(args):
                 prev["monitors_xml_existed"] = existed
                 save_state(prev)
             print(f"persisted to {MONITORS_XML} (backup at {MONITORS_XML_BACKUP})")
+
+    raw_text = gsettings_get("text-scaling-factor")
+    if (not args.no_fonts or args.text_scale is not None
+            or abs(target_text_scale - 1.0) > 1e-4
+            or raw_text not in (None, "1.0", "1")):
+        prev = load_state()
+        if "interface" not in prev:
+            prev["interface"] = {k: gsettings_get(k) for k in UI_FONT_KEYS}
+            save_state(prev)
+        if gsettings_op("set", "text-scaling-factor", f"{target_text_scale:g}"):
+            print(f"set text-scaling-factor={target_text_scale:g}")
+        else:
+            print(f"WARNING  could not set text-scaling-factor={target_text_scale:g}")
 
     if not args.no_fonts:
         rgba, hintstyle, gnome_aa, gnome_hint = PROFILES[args.profile]
@@ -915,7 +993,8 @@ def cmd_selftest(_args):
         "native": None, "scales": [1.0], "builtin": False,
     }
     # 4K panel with float32 fractional steps; 1.75 is not one of them (3840/1.75 is not
-    # an integer), so a forced scale has to snap to the closest offered value
+    # an integer), so a forced scale either snaps to the closest offered value or pairs
+    # the pixel-exact 2x with text-scaling-factor
     frac_panel = {
         "connectors": ["DP-7"], "x": 0, "y": 0, "scale": 1.0, "transform": 0,
         "primary": True, "current": ("2560x1440@59.951", 2560, 1440, 59.951),
@@ -923,6 +1002,9 @@ def cmd_selftest(_args):
         "scales": [1.0, 1.25, 1.5], "native_scales": [1.0, THIRDS, FRAC, 2.0],
         "builtin": False,
     }
+    # the same panel on a cable that will not do 2x: nothing can carry an in-between scale
+    no_int_panel = dict(frac_panel, connectors=["DP-8"],
+                        native_scales=[1.0, 1.25, THIRDS, 1.5, FRAC])
 
     def cfg_xml(lms):
         return ('  <configuration>\n    <layoutmode>logical</layoutmode>\n' + lms
@@ -1085,11 +1167,16 @@ def cmd_selftest(_args):
         r["fontconf_scratch_malformed"] = (not have_fc) or (not fontconf_ok(bad_fonts)[0])
     MONITORS_XML, MONITORS_XML_BACKUP = _real_xml, _real_bak
     try:
-        plan_fix([frac_panel], 1.75, 1920)
+        plan_fix([frac_panel], 5.0, 1920)
         r["forced_scale_rejected"] = False
     except ValueError as exc:
-        r["forced_scale_rejected"] = "1.75" in str(exc) and str(FRAC) in str(exc) and \
+        r["forced_scale_rejected"] = "5.0" in str(exc) and str(FRAC) in str(exc) and \
             str(THIRDS) in str(exc)
+    try:
+        plan_fix([no_int_panel], 1.75, 1920)
+        r["no_integer_step_rejected"] = False
+    except ValueError as exc:
+        r["no_integer_step_rejected"] = "1.75" in str(exc) and str(FRAC) in str(exc)
 
     checks = [
         ("detects upscaled signal", len(find_problems(fake)) == 1),
@@ -1125,9 +1212,19 @@ def cmd_selftest(_args):
          plan_fix([frac_panel], 1.67, 1920)[0] == {0: ("3840x2160@59.997", FRAC)}),
         ("plan snaps --scale 1.33 to the mode's 4/3 step",
          plan_fix([frac_panel], 1.33, 1920)[0] == {0: ("3840x2160@59.997", THIRDS)}),
-        ("plan refuses a scale the mode does not offer", r["forced_scale_rejected"]),
+        ("--scale 1.8 pairs pixel-exact 2x with text-scaling-factor 0.9",
+         resolve_scale_and_text(1.8, [1.0, 1.5, 2.0]) == (2.0, 0.9)),
+        ("--scale 1.75 pairs pixel-exact 2x with text-scaling-factor 0.875",
+         resolve_scale_and_text(1.75, [1.0, 1.5, 2.0]) == (2.0, 0.875)),
+        ("plan turns --scale 1.8 into a 2x framebuffer",
+         plan_fix([frac_panel], 1.8, 1920)[0] == {0: ("3840x2160@59.997", 2.0)}),
+        ("plan refuses a scale beyond every offered step", r["forced_scale_rejected"]),
+        ("plan refuses 1.75 when no integer step is offered",
+         r["no_integer_step_rejected"]),
         ("resolve_scale passes a scale through when the mode lists none",
          resolve_scale(1.75, []) == 1.75),
+        ("resolve_scale still snaps to an offered step",
+         resolve_scale(1.67, [1.0, FRAC, 2.0]) == FRAC),
         ("stored monitors.xml parsed", r["parsed"]),
         ("running match produces no note", r["match_ok"]),
         ("stored-vs-running mismatch detected", r["stale_detected"]),
@@ -1187,7 +1284,12 @@ def main():
     sub.add_parser("status", help="report active vs native mode and scale")
 
     f = sub.add_parser("fix", help="switch to native mode with an integer scale")
-    f.add_argument("--scale", type=float, help="force a framebuffer scale (e.g. 2)")
+    f.add_argument("--scale", type=float, help="force a framebuffer scale (e.g. 2); an "
+                                               "in-between value like 1.8 becomes an "
+                                               "integer framebuffer scale plus "
+                                               "text-scaling-factor")
+    f.add_argument("--text-scale", type=float,
+                   help="set text-scaling-factor (e.g. 0.9 at 2x for crisp 1.8x)")
     f.add_argument("--want-logical-width", type=int, default=1920,
                    help="keep at least this many logical pixels wide when picking an "
                         "integer scale (default 1920)")

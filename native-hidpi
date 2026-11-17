@@ -1182,7 +1182,9 @@ def x11_advice(stretched, gaps):
         msg += (" The systemd user environment has the Wayland hints now, so restarting them "
                 "should bring them up native.")
     if any("chrome" in cls.lower() or "chromium" in cls.lower() for cls, _m, _s in stretched):
-        msg += " Chrome also needs chrome://flags/#ozone-platform-hint set to Wayland or Auto."
+        msg += (" Chrome does not switch on the environment alone (157 stayed on X11 with "
+                "XDG_SESSION_TYPE=wayland): set chrome://flags/#ozone-platform-hint to Wayland "
+                "and relaunch it.")
     return msg
 
 

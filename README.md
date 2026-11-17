@@ -107,19 +107,29 @@ What changes in practice:
   Hyprland marks no preferred mode. An output already at native resolution keeps its
   refresh rate.
 - **Layout.** A scale change changes an output's logical width while Hyprland keeps its
-  old position, so side-by-side screens would overlap or leave a gap. A row of outputs
-  whose vertical extents touch is re-packed left to right in its current order, and an
-  existing overlap gets fixed on the way. Stacked or otherwise arranged outputs keep their
-  positions.
+  old position, so screens would overlap or leave a gap. A row whose vertical extents touch
+  is re-packed left to right in its current order; a single column (outputs at the same x)
+  is re-packed top to bottom. Any other arrangement keeps its positions, and if the new
+  rectangles intersect `fix` warns which two outputs will be stacked on top of each other -
+  it does not guess a layout it cannot derive from the current one.
 - **Mixed widths.** Per-output scales can give a row outputs of different logical widths;
   the row is re-packed for those widths too, so a 1.5x and a 1.2x panel sit at 0 and 2560
   instead of overlapping.
-- **Persisting** rewrites the rules that name each output (by connector or `desc:`) in
-  place: their spelling, trailing comment and anything after the scale (`transform`,
-  `bitdepth`, `vrr`, ...) stay. An output with no rule of its own gets a `desc:` rule,
-  which carries the serial, next to the other named rules. Every file edited is backed up
-  once as `<file>.native-hidpi.bak`. Then `hyprctl reload`, `configerrors`, and a read-back:
+- **Persisting** rewrites only rules that name exactly one connected output: a `desc:`
+  rule matching two panels is left alone (a reused description is ambiguous), as is a rule
+  for an output that is not changing and whose stored mode/scale already agrees with what
+  is running. A stored rule that disagrees is rewritten even when no live change is planned.
+  Rule spelling, trailing comment and anything after the scale (`transform`, `bitdepth`,
+  `vrr`, ...) stay. An output with no rule of its own gets a `desc:` rule carrying the
+  serial when its description is unique, otherwise a connector rule. Writes go through a
+  symlink instead of replacing it. Every file edited is backed up once as
+  `<file>.native-hidpi.bak`; `revert` undoes only the lines this tool wrote and keeps the
+  backups, so your own lines survive. Then `hyprctl reload`, `configerrors`, and a read-back:
   if another rule overrides the new one, `fix` says so instead of reporting success.
+- **A failed `hyprctl --batch` is treated as partial**, not as "nothing changed": `fix`
+  tries to put the previous rules back and says whether that worked. If it cannot, the
+  message names the failure and tells you to fix it yourself from the kept backup /
+  `state.json`. Mutter's single atomic apply keeps its old failure message.
 - **What `status` reports**, the Hyprland versions of "your change will be undone":
 
 ```
@@ -297,7 +307,9 @@ places:
 - the running session (`systemctl --user set-environment` and D-Bus activation), so
   apps started from now on get it without logging out;
 - on Hyprland, an `env =` line in `hyprland.conf` plus `hyprctl keyword env`, for apps
-  Hyprland starts itself (keybinds, `exec`).
+  Hyprland starts itself (keybinds, `exec`). The line is removed, or your original value
+  restored, when the profile no longer darkens; `revert` puts the live value back from your
+  original line rather than the one this tool wrote.
 
 Any other properties already in `FREETYPE_PROPERTIES` are kept. It works through
 FreeType's autofitter, which is what `hintslight` uses, so `sharp` (full bytecode hinting)
@@ -342,12 +354,16 @@ native-hidpi fix --no-display               fonts only (fontconfig, GSettings, s
 native-hidpi fix --dry-run                  print what would change
 ```
 
+`--no-display --scale ...` is rejected before anything is touched: a scale has no meaning
+when the display half is skipped (`--no-display --no-fonts` is still refused as before).
+
 Run `native-hidpi` with no arguments for the full help, `native-hidpi help` for the same list,
 and `native-hidpi help fix` (or `help status` / `help revert` / `help selftest`) for one
 command's help.
 
-Other subcommands: `status`, `revert`, `selftest` (140 assertions on the decision logic,
-including a scratch `monitors.xml` and scratch Hyprland config files; touches no display and no real config).
+Other subcommands: `status`, `revert`, `selftest` (173 assertions on the decision logic,
+including scratch `monitors.xml` and Hyprland config files, line-level undo, partial-apply
+messages and overlap warnings; touches no display and no real config).
 
 ## Safety
 
@@ -357,6 +373,9 @@ including a scratch `monitors.xml` and scratch Hyprland config files; touches no
   re-applied and the tool exits non-zero. Read-back cannot prove the panel is actually
   displaying an image - if it goes black, the previous configuration is what the tool
   restored, and Settings -> Displays remains the way out.
+- On Hyprland, a failed batch is rolled back where possible and the message says whether
+  that worked. Config writes go through symlinks; `revert` removes only this tool's own
+  lines, leaves your edits alone and keeps every `.bak` file.
 - `monitors.xml` is matched by connector **and serial**, backed up once, and is never
   edited if it does not parse.
 - Scales are compared with a float32-sized tolerance (1e-5) and written back at full
@@ -372,7 +391,7 @@ including a scratch `monitors.xml` and scratch Hyprland config files; touches no
 - `--scale` only ever sets a real framebuffer scale; `text-scaling-factor` is set solely by
   `--text-scale`, and a stale one is reset to 1.0 (recorded in `state.json` first, and put
   back by `revert`).
-- `state.json` and `monitors.xml`/`fonts.conf` writes are atomic.
+- `state.json`, `monitors.xml`, `fonts.conf` and Hyprland config writes are atomic.
 - `revert` keeps `state.json` when any step fails, so you can retry.
 - Refuses to run when Mutter reports no outputs (powered-off monitor, headless session)
   rather than claiming success.

@@ -151,10 +151,12 @@ NOTE     DP-3: only the catch-all `monitor = ,preferred,auto,auto` covers it, so
   exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE ELECTRON_OZONE_PLATFORM_HINT MOZ_ENABLE_WAYLAND QT_QPA_PLATFORM QT_QPA_PLATFORMTHEME
   ```
 
-  Chrome does not switch on the environment alone: Chrome 157 restarted with
-  `XDG_SESSION_TYPE=wayland` in its environment and still chose `--ozone-platform=x11`.
-  Set `chrome://flags/#ozone-platform-hint` to **Wayland** and relaunch; the setting lives
-  in the profile, so it holds however Chrome is started.
+  Changing the systemd environment is not enough for a launcher that is already running:
+  a shell that spawns apps itself (Quickshell's `execDetached`, for one) hands them the
+  environment *it* started with. Restart the launcher or log out and in, then restart the
+  apps. Chrome 157 needs no flag once it sees `XDG_SESSION_TYPE=wayland` - the same
+  profile comes up as `--ozone-platform=wayland` under GNOME - but if it still chooses
+  X11, `chrome://flags/#ozone-platform-hint` set to **Wayland** forces it.
   `xwayland:force_zero_scaling` is left alone: it stops the stretching, but without
   `GDK_SCALE`/`QT_SCALE_FACTOR` the apps it affects come out tiny.
 - `monitorv2 { }` blocks are not read or edited; only `monitor =` lines are.

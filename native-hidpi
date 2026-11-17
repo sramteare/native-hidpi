@@ -1202,12 +1202,12 @@ def x11_advice(stretched, gaps):
                 f"`exec-once = dbus-update-activation-environment --systemd "
                 f"{' '.join(LAUNCHER_ENV)} ...`, then restart those apps.")
     else:
-        msg += (" The systemd user environment has the Wayland hints now, so restarting them "
-                "should bring them up native.")
+        msg += (" The systemd user environment has the Wayland hints, but a launcher or shell "
+                "that was already running still hands its apps the environment it started "
+                "with: restart the launcher (or log out and in), then restart those apps.")
     if any("chrome" in cls.lower() or "chromium" in cls.lower() for cls, _m, _s in stretched):
-        msg += (" Chrome does not switch on the environment alone (157 stayed on X11 with "
-                "XDG_SESSION_TYPE=wayland): set chrome://flags/#ozone-platform-hint to Wayland "
-                "and relaunch it.")
+        msg += (" If Chrome still comes up on X11 after that, set "
+                "chrome://flags/#ozone-platform-hint to Wayland.")
     return msg
 
 

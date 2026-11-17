@@ -744,8 +744,31 @@ MONITOR_RE = re.compile(r"^(\s*monitor\s*=\s*)(.*?)(\s*)$")
 SOURCE_RE = re.compile(r"^\s*source\s*=\s*(.+?)\s*$")
 
 
-def is_hyprland():
-    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and bool(shutil.which("hyprctl"))
+def hypr_socket(env=None):
+    env = os.environ if env is None else env
+    sig = env.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        return None
+    runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "hypr", sig, ".socket.sock")
+
+
+def is_hyprland(env=None):
+    """HYPRLAND_INSTANCE_SIGNATURE alone is not proof: Hyprland configs import it into the
+    systemd user manager, which outlives the session, so a later GNOME login on the same
+    machine still carries it. Hyprland can leave the socket file behind as well, so the
+    test is whether something still answers on it."""
+    sock = hypr_socket(env)
+    if not sock or not shutil.which("hyprctl"):
+        return False
+    import socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(2)
+            conn.connect(sock)
+        return True
+    except OSError:
+        return False
 
 
 def hyprctl(*argv):
@@ -2167,6 +2190,14 @@ def cmd_selftest(_args):
         r["h_desc_rule_matches"] = hypr_rule_matches(
             {"fields": ["desc:Dell Inc. DELL U2720Q"]}, hstates[0]) and not \
             hypr_rule_matches({"fields": ["desc:Dell Inc. DELL U2720Q"]}, hstates[1])
+    with tempfile.TemporaryDirectory() as td:
+        import socket as _socket
+        os.makedirs(os.path.join(td, "hypr", "dead"))
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as srv:
+            srv.bind(os.path.join(td, "hypr", "dead", ".socket.sock"))
+        # bound and closed without unlinking: the file stays, nothing listens
+        r["h_dead_socket"] = os.path.exists(os.path.join(td, "hypr", "dead", ".socket.sock")) \
+            and not is_hyprland({"HYPRLAND_INSTANCE_SIGNATURE": "dead", "XDG_RUNTIME_DIR": td})
     try:
         plan_fix(hstates, 1.8, 1920)
         r["h_18_rejected"] = False
@@ -2250,6 +2281,14 @@ def cmd_selftest(_args):
          hypr_env_render("monitor = ,preferred,auto,1\n", "FT", "v").endswith("env = FT,v\n")),
         ("hypr env: a commented-out line is not taken as set",
          hypr_env_render("# env = FT,old\n", "FT", "v").count("env = FT,v") == 1),
+        ("hypr: a stale instance signature without its socket is not Hyprland",
+         not is_hyprland({"HYPRLAND_INSTANCE_SIGNATURE": "stale_1_2",
+                          "XDG_RUNTIME_DIR": "/nonexistent"})),
+        ("hypr: no signature is not Hyprland", not is_hyprland({})),
+        ("hypr: a leftover socket file nobody listens on is not Hyprland", r["h_dead_socket"]),
+        ("hypr: socket path built from runtime dir and signature",
+         hypr_socket({"HYPRLAND_INSTANCE_SIGNATURE": "abc", "XDG_RUNTIME_DIR": "/run/u"}) ==
+         "/run/u/hypr/abc/.socket.sock"),
         ("hypr: --scale already running needs no change",
          plan_fix(hstates, 1.5, 1920)[0] == {}),
         ("hypr: side-by-side row re-packed for the new width",

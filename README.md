@@ -325,7 +325,7 @@ native-hidpi fix --no-display               fonts only (fontconfig, GSettings, s
 native-hidpi fix --dry-run                  print what would change
 ```
 
-Other subcommands: `status`, `revert`, `selftest` (116 assertions on the decision logic,
+Other subcommands: `status`, `revert`, `selftest` (120 assertions on the decision logic,
 including a scratch `monitors.xml` and scratch Hyprland config files; touches no display and no real config).
 
 ## Safety

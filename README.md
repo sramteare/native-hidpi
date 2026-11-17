@@ -111,6 +111,9 @@ What changes in practice:
   whose vertical extents touch is re-packed left to right in its current order, and an
   existing overlap gets fixed on the way. Stacked or otherwise arranged outputs keep their
   positions.
+- **Mixed widths.** Per-output scales can give a row outputs of different logical widths;
+  the row is re-packed for those widths too, so a 1.5x and a 1.2x panel sit at 0 and 2560
+  instead of overlapping.
 - **Persisting** rewrites the rules that name each output (by connector or `desc:`) in
   place: their spelling, trailing comment and anything after the scale (`transform`,
   `bitdepth`, `vrr`, ...) stay. An output with no rule of its own gets a `desc:` rule,
@@ -201,6 +204,16 @@ Mutter answers InvalidArgs, Hyprland silently picks a different one). Closest av
 3.3333332538604736, 3.75, 4.0. It is not faked with text-scaling-factor, which only
 resizes GNOME text and leaves windows, Chrome and Electron at the old scale - pass
 --text-scale yourself if that is what you want.
+```
+
+With several outputs, repeat `--scale` as `CONNECTOR=NUMBER` to set them separately; use the
+names `status` prints. A bare value still applies to every output that is not named, and an
+unnamed output with no bare value keeps the scale it is running now.
+
+```
+$ native-hidpi fix --scale 1.5 --scale DP-3=1.2
+planned DP-2: 3840x2160@59.997 scale 2.0 -> 3840x2160@59.997 scale 1.5
+planned DP-3: 3840x2160@59.997 scale 2.0 -> 3840x2160@59.997 scale 1.2
 ```
 
 The temptation this refuses is real: `2.0 + text-scaling-factor 0.9` *looks* like the 1.8x
@@ -317,6 +330,8 @@ All of these belong to `fix`:
 native-hidpi fix --scale 2                  force a framebuffer scale; 1.6 / 1.66 / 1.67
                                             are shorthand for the mode's 5/3 step, and a
                                             step the mode does not have is refused
+native-hidpi fix --scale DP-2=1.5 \          set a scale for one output; repeat for more
+                 --scale DP-3=1.2            (unnamed outputs keep their current scale)
 native-hidpi fix --text-scale 0.9           set text-scaling-factor: resizes GNOME text
                                             only, never the framebuffer scale
 native-hidpi fix --want-logical-width 1920  keep at least this many logical px wide
@@ -327,7 +342,11 @@ native-hidpi fix --no-display               fonts only (fontconfig, GSettings, s
 native-hidpi fix --dry-run                  print what would change
 ```
 
-Other subcommands: `status`, `revert`, `selftest` (120 assertions on the decision logic,
+Run `native-hidpi` with no arguments for the full help, `native-hidpi help` for the same list,
+and `native-hidpi help fix` (or `help status` / `help revert` / `help selftest`) for one
+command's help.
+
+Other subcommands: `status`, `revert`, `selftest` (140 assertions on the decision logic,
 including a scratch `monitors.xml` and scratch Hyprland config files; touches no display and no real config).
 
 ## Safety

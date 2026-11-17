@@ -222,6 +222,43 @@ def resolve_scale(forced_scale, scales):
         f"Electron at the old scale - pass --text-scale yourself if that is what you want.")
 
 
+def parse_scale_args(values, connectors):
+    """Split --scale values into one optional default and per-connector scales."""
+    default, per_output = None, {}
+    known = list(connectors)
+    for raw in values or []:
+        text = str(raw).strip()
+        conn, sep, number = text.partition("=")
+        if sep:
+            conn = conn.strip()
+            if not conn:
+                raise ValueError(f"--scale: empty connector name in {text!r}")
+            if conn not in known:
+                raise ValueError(
+                    f"--scale: unknown connector {conn}; connected outputs: "
+                    f"{', '.join(known) or '(none)'}")
+            if conn in per_output:
+                raise ValueError(f"--scale: connector {conn} given more than once")
+        elif default is not None:
+            raise ValueError(
+                "--scale: only one bare scale is allowed; use CONNECTOR=NUMBER for a "
+                "specific output")
+        scale = number if sep else text
+        try:
+            scale = float(scale)
+        except ValueError:
+            raise ValueError(
+                f"--scale: {text!r} is not a number; use --scale NUMBER or "
+                "--scale CONNECTOR=NUMBER") from None
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(f"--scale: scale must be greater than 0 (got {text!r})")
+        if sep:
+            per_output[conn] = scale
+        else:
+            default = scale
+    return default, per_output
+
+
 def build_apply_list(states, changes):
     """The logical_monitors array is the complete desired configuration: anything left
     out is disabled. Always send every output, changing only what was asked for."""
@@ -1542,7 +1579,7 @@ def cmd_status(_args):
     return 0 if (problems == 0 and broken == 0 and not stretched) else 1
 
 
-def plan_fix(states, forced_scale, want_logical_width):
+def plan_fix(states, forced_scale, want_logical_width, per_output=None):
     changes, skipped = {}, []
     for i, m in enumerate(states):
         if m["current"] is None:
@@ -1556,8 +1593,27 @@ def plan_fix(states, forced_scale, want_logical_width):
         # rate, and only change the scale.
         target_mode = m["native"] if needs_mode else m["current"]
         target_scales = (m.get("native_scales") or m["scales"]) if needs_mode else m["scales"]
-        scale = (resolve_scale(forced_scale, target_scales) if forced_scale
-                 else best_integer_scale(target_mode, target_scales, want_logical_width))
+        if per_output:
+            named = [c for c in m["connectors"] if c in per_output]
+            given = {per_output[c] for c in named}
+            if len(given) > 1:
+                raise ValueError(f"{','.join(m['connectors'])}: conflicting per-output scales: "
+                                 + ", ".join(f"{c}={per_output[c]}" for c in named))
+            if named:
+                try:
+                    scale = resolve_scale(per_output[named[0]], target_scales)
+                except ValueError as exc:
+                    raise ValueError(f"{named[0]}: {exc}") from None
+            elif forced_scale:
+                scale = resolve_scale(forced_scale, target_scales)
+            elif needs_mode and not any(
+                    abs(float(s) - m["scale"]) <= SCALE_TOL for s in target_scales or []):
+                scale = best_integer_scale(target_mode, target_scales, want_logical_width)
+            else:
+                scale = m["scale"]
+        else:
+            scale = (resolve_scale(forced_scale, target_scales) if forced_scale
+                     else best_integer_scale(target_mode, target_scales, want_logical_width))
         needs_scale = abs(m["scale"] - scale) > SCALE_TOL
         if needs_mode or needs_scale:
             changes[i] = (target_mode[0], float(scale))
@@ -1575,7 +1631,12 @@ def cmd_fix(args):
     if args.no_display and args.no_fonts:
         sys.exit("--no-display and --no-fonts together leave nothing to do")
     try:
-        changes, skipped = plan_fix(states, args.scale, args.want_logical_width)
+        forced_scale, per_output = parse_scale_args(
+            args.scale, [c for s in states for c in s["connectors"]])
+    except ValueError as exc:
+        sys.exit(str(exc))
+    try:
+        changes, skipped = plan_fix(states, forced_scale, args.want_logical_width, per_output)
     except ValueError as exc:
         sys.exit(str(exc))
     drift = backend.drift(states)
@@ -2106,6 +2167,30 @@ def cmd_selftest(_args):
     except ValueError as exc:
         r["no_integer_step_rejected"] = "2.7" in str(exc) and str(FRAC) in str(exc)
 
+    def scale_arg_error(*values):
+        try:
+            parse_scale_args(values, ["DP-2", "DP-3"])
+        except ValueError as exc:
+            return str(exc)
+        return ""
+
+    r["parse_bad_number"] = scale_arg_error("1.5x")
+    r["parse_nonpositive"] = scale_arg_error("0")
+    r["parse_two_bare"] = scale_arg_error("1.5", "2")
+    r["parse_duplicate"] = scale_arg_error("DP-2=1.5", "DP-2=1.2")
+    r["parse_unknown"] = scale_arg_error("DP-9=2")
+    r["parse_empty_connector"] = scale_arg_error("=1.5")
+    try:
+        plan_fix([frac_panel], None, 1920, {"DP-7": 1.8})
+        r["per_output_18_error"] = ""
+    except ValueError as exc:
+        r["per_output_18_error"] = str(exc)
+    try:
+        plan_fix([mirror], None, 1920, {"eDP-1": 1.0, "DP-3": 2.0})
+        r["mirror_conflict_error"] = ""
+    except ValueError as exc:
+        r["mirror_conflict_error"] = str(exc)
+
     # Hyprland: hyprctl JSON in, monitor= rules out, against scratch config files
     def hmon(name, desc, serial, x, scale, modes, w=3840, h=2160, rate=59.997, **kw):
         return dict({"name": name, "description": desc, "serial": serial, "width": w,
@@ -2234,6 +2319,10 @@ def cmd_selftest(_args):
         ("hypr: --scale 1.5 from 2x re-packs the row to 2560 wide",
          hypr_targets(hstates_2x, plan_fix(hstates_2x, 1.5, 1920)[0])[1] ==
          {0: (0, 0), 1: (2560, 0)}),
+        ("hypr: per-output scales re-pack a row of mixed widths",
+         hypr_targets(hstates_2x, plan_fix(hstates_2x, None, 1920,
+                                          {"DP-2": 1.5, "DP-3": 1.2})[0])[1] ==
+         {0: (0, 0), 1: (2560, 0)}),
         ("hypr: XWayland window on a scaled output is flagged",
          hypr_stretched_x11(xclients, xstates, False) ==
          [("com.anthropic.Claude", "DP-2", 1.5), ("Google-chrome", "DP-3", 1.2)]),
@@ -2321,6 +2410,11 @@ def cmd_selftest(_args):
         ("hypr: desc: rules match by description prefix", r["h_desc_rule_matches"]),
     ]
 
+    top_parser, subparsers = build_parser()
+    top_help = top_parser.format_help()
+    fix_help = subparsers["fix"].format_help()
+    r["fix_option_help"] = all(a.help for a in subparsers["fix"]._actions)
+
     checks = [
         ("detects upscaled signal", len(find_problems(fake)) == 1),
         ("names the right connector", find_problems(fake)[0].startswith("DP-1")),
@@ -2351,6 +2445,42 @@ def cmd_selftest(_args):
          plan_fix([low_res_scaled], None, 1920)[0] == {0: ("3840x2160@59.997", 2.0)}),
         ("plan keeps the current refresh rate",
          plan_fix([stale], None, 1920)[0] == {0: ("3840x2160@29.562", 2.0)}),
+        ("bare --scale value parsed", parse_scale_args(["1.5"], ["DP-2"]) == (1.5, {})),
+        ("two per-output --scale values parsed",
+         parse_scale_args(["DP-2=1.5", "DP-3=1.2"], ["DP-2", "DP-3"]) ==
+         (None, {"DP-2": 1.5, "DP-3": 1.2})),
+        ("bare and per-output --scale values parsed together",
+         parse_scale_args(["1.5", "DP-2=1.2"], ["DP-2"]) == (1.5, {"DP-2": 1.2})),
+        ("--scale rejects a non-number", "not a number" in r["parse_bad_number"]),
+        ("--scale rejects a non-positive scale", "greater than 0" in r["parse_nonpositive"]),
+        ("--scale rejects two bare values", "only one bare scale" in r["parse_two_bare"]),
+        ("--scale rejects a repeated connector", "DP-2" in r["parse_duplicate"]),
+        ("--scale rejects an unknown connector and lists the outputs",
+         "DP-9" in r["parse_unknown"] and "DP-2" in r["parse_unknown"]
+         and "DP-3" in r["parse_unknown"]),
+        ("--scale rejects an empty connector name",
+         "empty connector" in r["parse_empty_connector"]),
+        ("plan gives two named outputs their own scales",
+         plan_fix([frac_panel, fake[1]], None, 1920, {"DP-7": 1.5, "DP-2": 1.0})[0] ==
+         {0: ("3840x2160@59.997", 1.5), 1: ("3840x2160@59.997", 1.0)}),
+        ("unnamed output keeps its current scale",
+         plan_fix([frac_panel, dict(frac_panel, connectors=["DP-9"])], None, 1920,
+                  {"DP-7": 1.5})[0] ==
+         {0: ("3840x2160@59.997", 1.5), 1: ("3840x2160@59.997", 1.0)}),
+        ("unnamed output takes the bare scale when given",
+         plan_fix([frac_panel, dict(frac_panel, connectors=["DP-9"])], 1.5, 1920,
+                  {"DP-7": 2.0})[0] ==
+         {0: ("3840x2160@59.997", 2.0), 1: ("3840x2160@59.997", 1.5)}),
+        ("per-output scale snaps 1.67 to the 5/3 step",
+         plan_fix([frac_panel], None, 1920, {"DP-7": 1.67})[0] ==
+         {0: ("3840x2160@59.997", FRAC)}),
+        ("unsupported per-output scale is refused by connector",
+         r["per_output_18_error"].startswith("DP-7: scale 1.8")),
+        ("mirrored pair named by either connector",
+         all(plan_fix([mirror], None, 1920, {conn: 2.0})[0] ==
+             {0: ("2880x1800@60", 2.0)} for conn in ("eDP-1", "DP-3"))),
+        ("mirrored pair refuses conflicting scales",
+         "eDP-1,DP-3" in r["mirror_conflict_error"]),
         ("plan snaps --scale 1.67 to the mode's 5/3 step",
          plan_fix([frac_panel], 1.67, 1920)[0] == {0: ("3840x2160@59.997", FRAC)}),
         ("plan snaps --scale 1.33 to the mode's 4/3 step",
@@ -2423,6 +2553,12 @@ def cmd_selftest(_args):
         ("malformed scratch fonts.conf rejected", r["fontconf_scratch_malformed"]),
         ("user fonts.conf parses (if present)",
          (not os.path.exists(FONTCONF)) or fontconf_ok(FONTCONF)[0]),
+        ("top-level help lists examples and every subcommand",
+         "examples" in top_help.lower() and
+         all(name in top_help for name in ("status", "fix", "revert", "selftest", "help"))),
+        ("fix help documents per-output scales and --no-display",
+         "CONNECTOR=NUMBER" in fix_help and "--no-display" in fix_help),
+        ("every fix option has help", r["fix_option_help"]),
     ]
     checks += hypr_checks
     failed = 0
@@ -2435,22 +2571,46 @@ def cmd_selftest(_args):
     return 1 if failed else 0
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__,
+def build_parser():
+    epilog = """examples:
+  native-hidpi status                                  show modes, scales and warnings
+  native-hidpi fix                                     switch to native mode and pick a scale
+  native-hidpi fix --dry-run                           show the plan without changing anything
+  native-hidpi fix --scale 1.5                         force one framebuffer scale everywhere
+  native-hidpi fix --scale DP-2=1.5 --scale DP-3=1.2   set a scale per output
+  native-hidpi fix --no-display                        fonts only, leave the display alone
+  native-hidpi fix --profile sharp                     choose the antialiasing profile
+  native-hidpi revert                                  restore the recorded configuration
+
+Works on GNOME (Mutter) and Hyprland."""
+    p = argparse.ArgumentParser(description=__doc__, epilog=epilog,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
+    subs = {}
 
-    sub.add_parser("status", help="report active vs native mode and scale")
+    subs["status"] = sub.add_parser(
+        "status", help="report active vs native mode and scale",
+        description="Report each output's active and native mode, scale and stored state.")
 
-    f = sub.add_parser("fix", help="switch to native mode with an integer scale")
-    f.add_argument("--scale", type=float, help="force a framebuffer scale (e.g. 2, or 1.6 "
-                                               "for Mutter's 5/3 step); a scale the mode "
-                                               "does not offer is refused, not faked with "
-                                               "text scaling")
-    f.add_argument("--text-scale", type=float,
+    fix_epilog = """examples:
+  native-hidpi fix --dry-run                         show the plan without changing anything
+  native-hidpi fix --scale 1.5                       force one framebuffer scale everywhere
+  native-hidpi fix --scale DP-2=1.5 --scale DP-3=1.2 set a scale per output
+  native-hidpi fix --no-display                      fonts only, leave the display alone
+  native-hidpi fix --profile sharp                   choose the antialiasing profile"""
+    f = sub.add_parser(
+        "fix", help="switch to native mode with an integer scale",
+        description="Switch outputs to their native mode and set framebuffer scales.",
+        epilog=fix_epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+    f.add_argument("--scale", action="append", metavar="NUMBER|CONNECTOR=NUMBER",
+                   help="force a framebuffer scale: a bare NUMBER applies to every output, "
+                        "CONNECTOR=NUMBER to one output (repeatable); shorthand such as 1.67 "
+                        "snaps to the mode's 5/3 step, and a scale the mode does not offer "
+                        "is refused, not faked with text scaling")
+    f.add_argument("--text-scale", type=float, metavar="NUMBER",
                    help="set text-scaling-factor (e.g. 0.9); this only resizes GNOME text, "
                         "not windows, Chrome or Electron")
-    f.add_argument("--want-logical-width", type=int, default=1920,
+    f.add_argument("--want-logical-width", type=int, default=1920, metavar="PIXELS",
                    help="keep at least this many logical pixels wide when picking an "
                         "integer scale (default 1920)")
     f.add_argument("--profile", choices=sorted(PROFILES), default="mac",
@@ -2460,11 +2620,31 @@ def main():
                    help="only touch fonts (fontconfig, GSettings, stem darkening); leave "
                         "modes, scales and layout as they are")
     f.add_argument("--dry-run", action="store_true", help="print what would change")
+    subs["fix"] = f
 
-    sub.add_parser("revert", help="restore the recorded mode, scale, gsettings and fonts.conf")
-    sub.add_parser("selftest", help="check the decision logic without touching the display")
+    subs["revert"] = sub.add_parser(
+        "revert", help="restore the recorded mode, scale, gsettings and fonts.conf",
+        description="Restore the mode, scale, gsettings and fonts.conf recorded by fix.")
+    subs["selftest"] = sub.add_parser(
+        "selftest", help="check the decision logic without touching the display",
+        description="Check the decision logic with synthetic states; touches no display.")
+    subs["help"] = sub.add_parser(
+        "help", help="show help for a subcommand",
+        description="Show top-level help, or help for one subcommand.")
+    subs["help"].add_argument("name", nargs="?", choices=sorted(subs),
+                              help="subcommand to explain (default: the general help)")
+    return p, subs
 
+
+def main():
+    p, subs = build_parser()
     args = p.parse_args()
+    if args.cmd is None or args.cmd == "help":
+        if args.cmd == "help" and args.name:
+            subs[args.name].print_help()
+        else:
+            p.print_help()
+        return 0
     return {"status": cmd_status, "fix": cmd_fix, "revert": cmd_revert,
             "selftest": cmd_selftest}[args.cmd](args)
 

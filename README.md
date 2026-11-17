@@ -3,8 +3,8 @@
 Find out whether your monitor is being fed the wrong resolution, and fix it
 **permanently**.
 
-On GNOME (Mutter) with Wayland. One file; needs `python3-gi`, plus `gsettings` and
-`fc-match` for the font half.
+On GNOME (Mutter) with Wayland, or on Hyprland. One file; needs `python3-gi` on GNOME
+(Hyprland goes through `hyprctl`), plus `gsettings` and `fc-match` for the font half.
 
 ## The problem this looks for
 
@@ -84,6 +84,78 @@ wrote ~/.config/fontconfig/fonts.conf and set antialiasing=grayscale, hinting=sl
 
 Browsers read fontconfig once at startup, so restart them.
 
+## Hyprland
+
+The same commands work in a Hyprland session (detected from
+`HYPRLAND_INSTANCE_SIGNATURE`); only the display half changes:
+
+| | GNOME | Hyprland |
+|---|---|---|
+| live state | `org.gnome.Mutter.DisplayConfig` | `hyprctl -j monitors all` |
+| apply | `ApplyMonitorsConfig`, every output | one `hyprctl --batch` of `keyword monitor` rules |
+| persisted in | `~/.config/monitors.xml` | the `monitor=` lines in `hyprland.conf` and every file it `source`s |
+| offered scales | what Mutter lists per mode | 1/120 steps that divide the mode into whole pixels |
+
+What changes in practice:
+
+- **`--scale`** works the same way: `native-hidpi fix --scale 1.5` keeps the native mode
+  at 1.5 on every output, and a scale that does not divide the mode into whole pixels
+  (1.75, 1.8 on 4K) is refused with the closest step. Hyprland's 1/120 grid has more exact
+  steps than Mutter offers, so `1.6` here is exactly 1.6 (3840/1.6 = 2400), not
+  shorthand for 5/3; type `1.67` for that.
+- **The native mode** is the largest one in `availableModes`, first in kernel order, since
+  Hyprland marks no preferred mode. An output already at native resolution keeps its
+  refresh rate.
+- **Layout.** A scale change changes an output's logical width while Hyprland keeps its
+  old position, so side-by-side screens would overlap or leave a gap. A row of outputs
+  whose vertical extents touch is re-packed left to right in its current order, and an
+  existing overlap gets fixed on the way. Stacked or otherwise arranged outputs keep their
+  positions.
+- **Persisting** rewrites the rules that name each output (by connector or `desc:`) in
+  place: their spelling, trailing comment and anything after the scale (`transform`,
+  `bitdepth`, `vrr`, ...) stay. An output with no rule of its own gets a `desc:` rule,
+  which carries the serial, next to the other named rules. Every file edited is backed up
+  once as `<file>.native-hidpi.bak`. Then `hyprctl reload`, `configerrors`, and a read-back:
+  if another rule overrides the new one, `fix` says so instead of reporting success.
+- **What `status` reports**, the Hyprland versions of "your change will be undone":
+
+```
+NOTE     ~/.config/hypr/monitors.conf has monitor rules for DP-2, DP-3 but nothing
+         sources it from ~/.config/hypr/hyprland.conf, so they have no effect
+NOTE     DP-3: only the catch-all `monitor = ,preferred,auto,auto` covers it, so Hyprland
+         picks the scale itself on every reload or hotplug (running 1 now)
+```
+
+  The first is what `nwg-displays` leaves behind until you uncomment its `source =` line.
+  The second is how two identical 4K panels end up at 1.5 and 1.0: `auto` decides per
+  panel from its DPI.
+- **XWayland, the usual reason text stays soft.** At any scale above 1, Hyprland draws an
+  X11 client at 1x and stretches it, so its text is resampled whatever the scale or
+  fontconfig says. `status` lists every XWayland window on a scaled output as a WARNING
+  (and exits non-zero):
+
+  ```
+  WARNING  com.anthropic.Claude on DP-2 (scale 1.5), Google-chrome on DP-3 (scale 1.5)
+           run under XWayland: Hyprland draws them at 1x and stretches them ...
+  ```
+
+  The usual cause is not the app but how it was started. A launcher (Caelestia, rofi via
+  systemd, D-Bus activation) starts apps under `systemd --user`, not as children of
+  Hyprland, so they never see the `env =` lines in `hyprland.conf`; without
+  `XDG_SESSION_TYPE=wayland` and `ELECTRON_OZONE_PLATFORM_HINT` there, Chrome and
+  Electron apps fall back to X11. `status` checks `systemctl --user show-environment` for
+  those and says which are missing. The fix is one line at login, then restarting the
+  apps:
+
+  ```
+  exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE HYPRLAND_INSTANCE_SIGNATURE ELECTRON_OZONE_PLATFORM_HINT MOZ_ENABLE_WAYLAND QT_QPA_PLATFORM QT_QPA_PLATFORMTHEME
+  ```
+
+  Chrome also reads `chrome://flags/#ozone-platform-hint` (set it to Wayland or Auto).
+  `xwayland:force_zero_scaling` is left alone: it stops the stretching, but without
+  `GDK_SCALE`/`QT_SCALE_FACTOR` the apps it affects come out tiny.
+- `monitorv2 { }` blocks are not read or edited; only `monitor =` lines are.
+
 ## Scale: why 2x and not 1.5x
 
 Density is `mode / scale`. Only an **integer** scale maps one logical pixel onto one
@@ -117,9 +189,9 @@ step and the full list of supported ones:
 
 ```
 $ native-hidpi fix --scale 1.8
-scale 1.8 is not a framebuffer scale this mode offers: Mutter only accepts scales that
-divide the mode into whole pixels (3840/1.8 = 2133.33 is one such rejection) and answers
-InvalidArgs to the rest. Closest available: 1.6666666269302368; supported: 1.0, 1.25,
+scale 1.8 is not a framebuffer scale this mode offers: the compositor only accepts
+scales that divide the mode into whole pixels (3840/1.8 = 2133.33 is one such rejection;
+Mutter answers InvalidArgs, Hyprland silently picks a different one). Closest available: 1.6666666269302368; supported: 1.0, 1.25,
 1.3333333730697632, 1.5, 1.6666666269302368, 2.0, 2.5, 2.6666667461395264, 3.0,
 3.3333332538604736, 3.75, 4.0. It is not faked with text-scaling-factor, which only
 resizes GNOME text and leaves windows, Chrome and Electron at the old scale - pass
@@ -174,11 +246,46 @@ gsettings set org.gnome.shell.extensions.dash-to-dock dash-max-icon-size 32
 
 | profile | fontconfig | GSettings | notes |
 |---|---|---|---|
-| `mac` (default) | `rgba=none`, `hintslight` | grayscale, slight | approximates macOS text: grayscale AA with light hinting (macOS adds its own stem darkening, which FreeType/fontconfig here do not expose) |
+| `mac` (default) | `rgba=none`, `hintslight` | grayscale, slight | approximates macOS text: grayscale AA, light hinting, and FreeType stem darkening (below) |
 | `sharp` | `rgba=none`, `hintfull` | grayscale, full | maximum edge definition at 1x |
 | `subpixel` | `rgba=rgb`, `hintslight` | rgba, slight | worth trying only on a sub-110 PPI panel at 1x |
 
 Choose with `native-hidpi fix --profile sharp`.
+
+### Stem darkening
+
+Grayscale AA and light hinting get the shapes right, but macOS text also looks *heavier*:
+it thickens thin strokes on screen, most at small sizes. FreeType can do the same - stem
+darkening - but it is not a fontconfig setting. It is a FreeType property read from the
+environment of each app:
+
+```
+FREETYPE_PROPERTIES="cff:no-stem-darkening=0 autofitter:no-stem-darkening=0"
+```
+
+Measured on Ubuntu 26.04 by rendering one line of text through cairo/FreeType with and
+without it (sum of coverage, i.e. how much ink the strokes put down):
+
+| font | 16.5 px | 22 px |
+|---|---|---|
+| Ubuntu Sans | +13.5% | +4.2% |
+| Noto Sans | +17.3% | +11.8% |
+
+The `mac` profile turns it on. Since it has to reach every app, `fix` puts it in three
+places:
+
+- `~/.config/environment.d/90-native-hidpi.conf`, which systemd reads at login, so
+  launcher-started and D-Bus-activated apps (and GNOME's session) get it;
+- the running session (`systemctl --user set-environment` and D-Bus activation), so
+  apps started from now on get it without logging out;
+- on Hyprland, an `env =` line in `hyprland.conf` plus `hyprctl keyword env`, for apps
+  Hyprland starts itself (keybinds, `exec`).
+
+Any other properties already in `FREETYPE_PROPERTIES` are kept. It works through
+FreeType's autofitter, which is what `hintslight` uses, so `sharp` (full bytecode hinting)
+would get no darkening; `fix --profile sharp` or `subpixel` takes the keys back out.
+Apps read it once at startup, so restart them. Chrome bundles its own FreeType and may
+ignore it.
 
 Which layer reaches which client, as far as I have verified:
 
@@ -210,11 +317,13 @@ native-hidpi fix --text-scale 0.9           set text-scaling-factor: resizes GNO
 native-hidpi fix --want-logical-width 1920  keep at least this many logical px wide
 native-hidpi fix --profile sharp            antialiasing profile
 native-hidpi fix --no-fonts                 display config only
+native-hidpi fix --no-display               fonts only (fontconfig, GSettings, stem
+                                            darkening): modes, scales, layout untouched
 native-hidpi fix --dry-run                  print what would change
 ```
 
-Other subcommands: `status`, `revert`, `selftest` (62 assertions on the decision logic,
-including a scratch `monitors.xml`; touches no display and no real config).
+Other subcommands: `status`, `revert`, `selftest` (116 assertions on the decision logic,
+including a scratch `monitors.xml` and scratch Hyprland config files; touches no display and no real config).
 
 ## Safety
 
@@ -243,14 +352,17 @@ including a scratch `monitors.xml`; touches no display and no real config).
 - `revert` keeps `state.json` when any step fails, so you can retry.
 - Refuses to run when Mutter reports no outputs (powered-off monitor, headless session)
   rather than claiming success.
-- No root. Writes: `~/.config/monitors.xml` (+ `.native-hidpi.bak`),
-  `org.gnome.desktop.interface` GSettings, `~/.config/fontconfig/fonts.conf`
+- No root. Writes: `~/.config/monitors.xml` (+ `.native-hidpi.bak`) on GNOME, the
+  `monitor=` lines of the sourced Hyprland config files (+ `.native-hidpi.bak` each) on
+  Hyprland (plus one `env =` line in `hyprland.conf` for stem darkening),
+  `~/.config/environment.d/90-native-hidpi.conf`, the systemd user environment's
+  `FREETYPE_PROPERTIES`, `org.gnome.desktop.interface` GSettings, `~/.config/fontconfig/fonts.conf`
   (+ `.native-hidpi.bak`), `~/.local/state/native-hidpi/state.json`.
 
 ## Requirements and limits
 
-- A GNOME session running Mutter; it needs `org.gnome.Mutter.DisplayConfig`. On non-GNOME
-  desktops it exits with a clear message. It will also *run* on GNOME on Xorg, but the
+- A GNOME session running Mutter (it needs `org.gnome.Mutter.DisplayConfig`), or a
+  Hyprland session with `hyprctl` on the path. Anywhere else it exits with a clear message. It will also *run* on GNOME on Xorg, but the
   framebuffer-scale reasoning here is Wayland-specific, and on Xorg the mode is better set
   with `xrandr`.
 - Multi-monitor: every output is included in the applied configuration; each run changes
@@ -261,7 +373,9 @@ including a scratch `monitors.xml`; touches no display and no real config).
   native eDP mode is resampled too, so the warning applies there as well - it is just much
   rarer than on external displays.
 - Written and tested on Ubuntu 26.04, GNOME Shell / Mutter 50.1, Dell U2720Q (single
-  output), Google Chrome 157, snap Firefox 160. Other vendors' EDID quirks are untested.
+  output), Google Chrome 157, snap Firefox 160. On Hyprland 0.53.3 with a Dell U2720Q and
+  U3225QE side by side, `fix` took both from 1.5 to 2x live, re-packed them to
+  0x0 / 1920x0 and persisted the rules, confirmed by reload and read-back. Other vendors' EDID quirks are untested.
 
 ## Why this is a script and not a patch to Ubuntu
 

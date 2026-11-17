@@ -38,6 +38,16 @@ native-hidpi fix      # native mode + integer scale, persisted, plus antialiasin
 native-hidpi revert   # back to whatever it was
 ```
 
+It also works on **Hyprland** now. There the usual culprit is different: Chrome and
+Electron apps started from a launcher run under `systemd --user`, never see the `env =`
+lines in `hyprland.conf`, and fall back to XWayland, where Hyprland draws them at 1x and
+stretches them by the monitor scale. `native-hidpi status` lists those windows and says
+which variables the session is missing.
+
+The default `mac` profile now also turns on FreeType *stem darkening*, which thickens
+thin strokes the way macOS does (about +4% to +17% stroke weight at UI sizes, most at the
+smallest).
+
 ## Why the fix keeps disappearing (the part nobody mentions)
 
 Applying a mode through the display API does not reliably rewrite

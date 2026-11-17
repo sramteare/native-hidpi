@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Check that a GNOME session drives a monitor at its native resolution, and switch
-to native mode with an integer framebuffer scale.
+"""Check that a GNOME (Mutter) or Hyprland session drives a monitor at its native
+resolution, and switch to native mode with an integer framebuffer scale.
 
 The common failure this addresses: a 4K panel fed a 1440p signal. The monitor's own
 scaler upsamples every pixel by a non-integer factor, so the whole desktop looks soft.
@@ -9,19 +9,28 @@ the resolution just "looks a bit blurry".
 """
 
 import argparse
+import glob
+import itertools
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 
+# python3-gi is only needed to talk to Mutter; the Hyprland backend uses hyprctl.
 try:
     import gi
     gi.require_version("Gio", "2.0")
     from gi.repository import Gio, GLib
-except ImportError:
-    sys.exit("python3-gi is required:  sudo apt install python3-gi")
+    HAVE_GI = True
+    MUTTER_ERRORS = (GLib.Error, RuntimeError)
+except (ImportError, ValueError):
+    Gio = GLib = None
+    HAVE_GI = False
+    MUTTER_ERRORS = (RuntimeError,)
 
 DEST = "org.gnome.Mutter.DisplayConfig"
 PATH = "/org/gnome/Mutter/DisplayConfig"
@@ -67,6 +76,22 @@ PROFILES = {
     "subpixel": ("rgb", "hintslight", "rgba", "slight"),
 }
 
+# FreeType stem darkening: thickens thin strokes at small sizes, which is most of what makes
+# macOS text look heavier and smoother than Linux's at the same size. It is not a fontconfig
+# setting but a FreeType property read from the environment, so it has to reach every app:
+# environment.d for the systemd user session (launcher-started apps, next login), the live
+# session (set-environment), and on Hyprland an `env =` line for apps Hyprland starts. It
+# acts through the autofitter, i.e. with hintslight; hintfull uses the fonts' own bytecode
+# hinting and gets none, so only the mac profile turns it on.
+DARKEN_PROFILES = ("mac",)
+FT_VAR = "FREETYPE_PROPERTIES"
+FT_DARKEN_KEYS = ("cff:no-stem-darkening", "autofitter:no-stem-darkening")
+ENVD_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "environment.d",
+    "90-native-hidpi.conf",
+)
+
 
 def bus_call(method, inb=None, outt=None):
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -78,6 +103,8 @@ def bus_call(method, inb=None, outt=None):
 
 
 def have_display_config():
+    if not HAVE_GI:
+        return False
     try:
         bus_call("GetCurrentState", None, STATE_SIG)
         return True
@@ -153,9 +180,20 @@ def best_integer_scale(native, scales, want_logical_width=1920):
 def scale_matches(s, wanted):
     """True when `wanted` is how a person writes the float32 step `s`. Mutter's repeating
     thirds come back as 1.6666666269302368 or 2.6666667461395264, and people type 1.6,
-    1.66 or 1.67 for them, so either rounding or truncation at one or two decimals counts."""
-    return (round(s, 1) == wanted or math.floor(s * 10) / 10 == wanted
-            or round(s, 2) == wanted or math.floor(s * 100) / 100 == wanted)
+    1.66 or 1.67 for them, so either rounding or truncation at one or two decimals counts.
+    Truncation is only shorthand for a step that has no finite decimal form: 1.875 is
+    typed as 1.875, so `1.8` must not land on it (Hyprland's 1/120 grid has 15/8)."""
+    if round(s, 1) == wanted or round(s, 2) == wanted:
+        return True
+    from fractions import Fraction
+    den = Fraction(s).limit_denominator(1000).denominator
+    while den % 2 == 0:
+        den //= 2
+    while den % 5 == 0:
+        den //= 5
+    repeating = den > 1
+    return repeating and (math.floor(s * 10) / 10 == wanted
+                          or math.floor(s * 100) / 100 == wanted)
 
 
 def resolve_scale(forced_scale, scales):
@@ -175,9 +213,10 @@ def resolve_scale(forced_scale, scales):
         return float(min(matches, key=lambda s: abs(s - wanted)))
     closest = min(offered, key=lambda s: abs(s - wanted))
     raise ValueError(
-        f"scale {wanted} is not a framebuffer scale this mode offers: Mutter only accepts "
-        f"scales that divide the mode into whole pixels (3840/1.8 = 2133.33 is one such "
-        f"rejection) and answers InvalidArgs to the rest. Closest available: {closest}; "
+        f"scale {wanted} is not a framebuffer scale this mode offers: the compositor only "
+        f"accepts scales that divide the mode into whole pixels (3840/1.8 = 2133.33 is one "
+        f"such rejection; Mutter answers InvalidArgs, Hyprland silently picks a different "
+        f"one). Closest available: {closest}; "
         f"supported: {', '.join(str(s) for s in offered)}. It is not faked with "
         f"text-scaling-factor, which only resizes GNOME text and leaves windows, Chrome and "
         f"Electron at the old scale - pass --text-scale yourself if that is what you want.")
@@ -369,6 +408,64 @@ def write_fontconf(rgba, hintstyle):
             os.remove(FONTCONF)
         sys.exit(f"fontconfig rejected {FONTCONF}; previous file restored.\n{err}")
     return True
+
+
+def ft_merge(existing, darken):
+    """FREETYPE_PROPERTIES with stem darkening switched on (or our keys dropped), keeping
+    any other property the user already sets there, e.g. truetype:interpreter-version."""
+    props = [t for t in (existing or "").split()
+             if t.split("=", 1)[0] not in FT_DARKEN_KEYS]
+    if darken:
+        props += [f"{k}=0" for k in FT_DARKEN_KEYS]
+    return " ".join(props)
+
+
+def ft_darkened(value):
+    tokens = (value or "").split()
+    return all(f"{k}=0" in tokens for k in FT_DARKEN_KEYS)
+
+
+def envd_body(value):
+    return ("# written by native-hidpi: FreeType stem darkening (thicker, macOS-like strokes\n"
+            "# at small sizes). Read by systemd --user at login; `native-hidpi revert` removes it.\n"
+            f'{FT_VAR}="{value}"\n')
+
+
+def systemd_env_get(name):
+    if not shutil.which("systemctl"):
+        return None
+    out = subprocess.run(["systemctl", "--user", "show-environment"], check=False,
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        if k == name:
+            if v.startswith("$'") and v.endswith("'"):
+                v = v[2:-1]
+            return v
+    return None
+
+
+def session_env_set(name, value):
+    """Set (or with None, unset) a variable for apps started from here on: the systemd user
+    manager and D-Bus activation. Returns False if systemctl refused."""
+    ok = True
+    if shutil.which("systemctl"):
+        argv = (["systemctl", "--user", "set-environment", f"{name}={value}"]
+                if value is not None else ["systemctl", "--user", "unset-environment", name])
+        ok = subprocess.run(argv, check=False, capture_output=True).returncode == 0
+    if shutil.which("dbus-update-activation-environment"):
+        # D-Bus cannot unset; an empty FREETYPE_PROPERTIES is the same as none
+        subprocess.run(["dbus-update-activation-environment", f"{name}={value or ''}"],
+                       check=False, capture_output=True)
+    return ok
+
+
+def write_text_atomic(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
 
 
 def save_state(data):
@@ -621,23 +718,764 @@ def stored_vs_running(states):
     return notes
 
 
+# ---------------------------------------------------------------------------------------
+# Hyprland
+#
+# Hyprland has no DisplayConfig: the live state comes from `hyprctl -j monitors`, a change
+# is a `keyword monitor` rule, and what survives a reload, hotplug or login is whatever
+# `monitor=` lines the *sourced* config files hold. A monitors.conf that nothing sources
+# (nwg-displays writes one and leaves the `source =` line to you) is the Hyprland twin of
+# a monitors.xml that Mutter never rewrote: the change looks applied and then is not.
+# ---------------------------------------------------------------------------------------
+
+HYPR_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "hypr"
+)
+HYPR_CONF = os.path.join(HYPR_DIR, "hyprland.conf")
+HYPR_BACKUP_SUFFIX = ".native-hidpi.bak"
+# Hyprland keeps scales on 1/120 steps (the fractional-scale-v1 denominator) and only
+# one that divides the mode into whole logical pixels; anything else it swaps for a
+# nearby scale with a notification, so the request is refused here instead.
+HYPR_SCALE_DEN = 120
+HYPR_SCALE_TOL = 1e-3
+HYPR_SKIPPED = []  # outputs left alone on the last read (mirrors), for status
+MODE_RE = re.compile(r"\s*(\d+)x(\d+)(?:@([\d.]+)(?:Hz)?)?\s*$")
+MONITOR_RE = re.compile(r"^(\s*monitor\s*=\s*)(.*?)(\s*)$")
+SOURCE_RE = re.compile(r"^\s*source\s*=\s*(.+?)\s*$")
+
+
+def is_hyprland():
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")) and bool(shutil.which("hyprctl"))
+
+
+def hyprctl(*argv):
+    try:
+        r = subprocess.run(["hyprctl", *argv], check=False, capture_output=True,
+                           text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"hyprctl {' '.join(argv)}: {exc}")
+    if r.returncode != 0:
+        raise RuntimeError(f"hyprctl {' '.join(argv)}: {(r.stderr or r.stdout).strip()}")
+    return r.stdout
+
+
+def hypr_scales(w, h, lo=1.0, hi=4.0):
+    """Every 1/120 step that divides w x h into whole logical pixels."""
+    return [k / HYPR_SCALE_DEN
+            for k in range(int(lo * HYPR_SCALE_DEN), int(hi * HYPR_SCALE_DEN) + 1)
+            if (w * HYPR_SCALE_DEN) % k == 0 and (h * HYPR_SCALE_DEN) % k == 0]
+
+
+def hypr_snap(scale):
+    """hyprctl prints scales rounded; put them back on the 1/120 grid they live on."""
+    k = round(float(scale) * HYPR_SCALE_DEN)
+    return k / HYPR_SCALE_DEN if k and abs(k / HYPR_SCALE_DEN - scale) < 0.005 else float(scale)
+
+
+def hypr_parse_mode(text):
+    """'3840x2160@60.00Hz' / '3840x2160@59.997' / '3840x2160' -> (w, h, rate)."""
+    m = MODE_RE.match(text or "")
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), float(m.group(3) or 0.0)
+
+
+def hypr_mode(w, h, rate):
+    """Mode tuple in the shape the shared logic uses; the id is a valid rule resolution."""
+    r = f"{float(rate):.3f}".rstrip("0").rstrip(".")
+    return (f"{w}x{h}@{r}", int(w), int(h), float(rate))
+
+
+def logical_size(w, h, scale, transform=0):
+    if int(transform) % 2:  # 90/270, flipped or not
+        w, h = h, w
+    return w / scale, h / scale
+
+
+def hypr_states_from_json(monitors):
+    """Turn `hyprctl -j monitors all` into the state dicts the shared logic works on."""
+    out, skipped = [], []
+    for m in monitors:
+        name = m.get("name", "?")
+        if m.get("disabled"):
+            continue
+        if m.get("mirrorOf") not in (None, "", "none"):
+            skipped.append(f"{name} mirrors {m['mirrorOf']}; left alone")
+            continue
+        cur = hypr_mode(m["width"], m["height"], m.get("refreshRate", 0.0))
+        modes = [p for p in (hypr_parse_mode(t) for t in m.get("availableModes", [])) if p]
+        # Hyprland marks no preferred mode, but the list is the kernel's, which puts the
+        # preferred mode first: the first entry with the largest area is the panel's own.
+        best = max(modes, key=lambda p: p[0] * p[1]) if modes else None
+        native = hypr_mode(*best) if best else None
+        serial = m.get("serial") or ""
+        out.append({
+            "connectors": [name],
+            "specs": [(name, serial)],
+            "identity": ((name, serial),),
+            "name": name,
+            "description": m.get("description") or "",
+            "x": int(m.get("x", 0)),
+            "y": int(m.get("y", 0)),
+            "scale": hypr_snap(float(m.get("scale", 1.0))),
+            "transform": int(m.get("transform", 0)),
+            "primary": bool(m.get("focused")),
+            "current": cur,
+            "native": native,
+            "scales": hypr_scales(cur[1], cur[2]),
+            "native_scales": hypr_scales(native[1], native[2]) if native else [],
+            "builtin": name.startswith(("eDP", "LVDS", "DSI")),
+            "id": m.get("id"),
+        })
+    return out, skipped
+
+
+def hypr_read_state():
+    global HYPR_SKIPPED
+    try:
+        data = json.loads(hyprctl("-j", "monitors", "all"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"hyprctl returned unreadable JSON: {exc}")
+    states, HYPR_SKIPPED = hypr_states_from_json(data)
+    return 0, states
+
+
+def hypr_strip_comment(line):
+    """Split a config line into (body, comment). '##' is Hyprland's escaped '#'."""
+    i = 0
+    while i < len(line):
+        if line[i] == "#":
+            if line[i + 1:i + 2] == "#":
+                i += 2
+                continue
+            return line[:i], line[i:]
+        i += 1
+    return line, ""
+
+
+def hypr_config_files(path=None, _seen=None):
+    """hyprland.conf and everything it sources, in the order Hyprland reads them."""
+    path = path or HYPR_CONF
+    seen = [] if _seen is None else _seen
+    if not os.path.isfile(path) or \
+            os.path.realpath(path) in {os.path.realpath(p) for p in seen}:
+        return seen
+    seen.append(path)
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return seen
+    for line in lines:
+        m = SOURCE_RE.match(hypr_strip_comment(line)[0])
+        if not m:
+            continue
+        target = os.path.expandvars(os.path.expanduser(m.group(1)))
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(path), target)
+        target = os.path.normpath(target)
+        for t in sorted(glob.glob(target)) or [target]:
+            hypr_config_files(t, seen)
+    return seen
+
+
+def hypr_rules(files):
+    """Every `monitor =` line (not monitorv2 blocks) with where it lives."""
+    rules = []
+    for path in files:
+        try:
+            with open(path) as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for n, line in enumerate(lines):
+            body, comment = hypr_strip_comment(line)
+            m = MONITOR_RE.match(body)
+            if not m:
+                continue
+            rules.append({"path": path, "line": n, "prefix": m.group(1), "trail": m.group(3),
+                          "comment": comment,
+                          "fields": [f.strip() for f in m.group(2).split(",")]})
+    return rules
+
+
+def hypr_rule_kind(rule):
+    f = rule["fields"]
+    if len(f) > 1 and f[1].lower() in ("disable", "disabled"):
+        return "disable"
+    if len(f) > 1 and f[1].lower() == "addreserved":
+        return "reserved"
+    return "mode" if len(f) >= 4 else "other"
+
+
+def hypr_rule_matches(rule, s):
+    sel = rule["fields"][0]
+    if sel.startswith("desc:"):
+        want = sel[5:].strip()
+        return bool(want) and s.get("description", "").startswith(want)
+    return bool(sel) and sel == s["name"]
+
+
+def hypr_own_rules(rules, s):
+    """Rules naming this output (by connector or desc:); the last one is what applies."""
+    return [r for r in rules if hypr_rule_kind(r) == "mode" and hypr_rule_matches(r, s)]
+
+
+def hypr_rule_value(selector, mode_id, pos, scale, extras):
+    return ",".join([selector, mode_id, f"{pos[0]}x{pos[1]}", format_scale(scale), *extras])
+
+
+def hypr_extras(s, rules):
+    """Keep transform/bitdepth/vrr/... that the user's own rule carries after the scale."""
+    own = hypr_own_rules(rules, s)
+    if own:
+        return own[-1]["fields"][4:]
+    return ["transform", str(s["transform"])] if s["transform"] else []
+
+
+def hypr_layout(states, targets):
+    """New logical positions. Changing a scale changes an output's logical width, and
+    Hyprland keeps the old position, so side-by-side screens would overlap (or gap). A row
+    of outputs whose vertical extents touch is re-packed left to right in its current
+    order; anything else keeps its positions. targets: i -> (w, h, scale)."""
+    order = sorted(range(len(states)), key=lambda i: (states[i]["x"], states[i]["y"]))
+    old = {}
+    for i in order:
+        s = states[i]
+        old[i] = logical_size(s["current"][1], s["current"][2], s["scale"], s["transform"])
+    row = all(states[a]["y"] < states[b]["y"] + old[b][1] and
+              states[b]["y"] < states[a]["y"] + old[a][1]
+              for a, b in itertools.pairwise(order))
+    if not row:
+        return {i: (s["x"], s["y"]) for i, s in enumerate(states)}, False
+    pos, x = {}, states[order[0]]["x"] if order else 0
+    for i in order:
+        w, h, scale = targets[i]
+        pos[i] = (round(x), states[i]["y"])
+        x += logical_size(w, h, scale, states[i]["transform"])[0]
+    return pos, True
+
+
+def hypr_targets(states, changes, positions=None):
+    """(targets, positions, todo): what every output should run, where it goes, and the
+    outputs that actually need a rule sent (changed, or moved by the re-layout)."""
+    targets = {}
+    for i, s in enumerate(states):
+        mode_id, scale = changes.get(i, (s["current"][0], s["scale"]))
+        w, h, _rate = hypr_parse_mode(mode_id)
+        targets[i] = (mode_id, w, h, float(scale))
+    if positions is None:
+        if changes:
+            positions, _ = hypr_layout(states, {i: t[1:] for i, t in targets.items()})
+        else:
+            positions = {i: (s["x"], s["y"]) for i, s in enumerate(states)}
+    todo = [i for i in targets
+            if i in changes or tuple(positions[i]) != (states[i]["x"], states[i]["y"])]
+    return targets, positions, todo
+
+
+def hypr_commands(states, targets, positions, todo, rules):
+    return ["keyword monitor " + hypr_rule_value(
+                states[i]["name"], targets[i][0], positions[i], targets[i][3],
+                hypr_extras(states[i], rules))
+            for i in todo]
+
+
+def hypr_verify(want, retries=2):
+    """want: name -> (w, h, rate, scale, (x, y)). Read back from hyprctl."""
+    bad = []
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(0.5)
+        _serial, states = hypr_read_state()
+        by_name = {s["name"]: s for s in states}
+        bad = []
+        for name, (w, h, rate, scale, pos) in want.items():
+            s = by_name.get(name)
+            if s is None:
+                bad.append(f"{name}: missing after apply")
+                continue
+            c = s["current"]
+            if (c[1], c[2]) != (w, h) or (rate and abs(c[3] - rate) > 0.5) or \
+                    abs(s["scale"] - scale) > HYPR_SCALE_TOL or (s["x"], s["y"]) != tuple(pos):
+                bad.append(f"{name}: wanted {w}x{h}@{rate:g} scale {format_scale(scale)} at "
+                           f"{pos[0]}x{pos[1]}, got {c[0]} scale {format_scale(s['scale'])} "
+                           f"at {s['x']}x{s['y']}")
+        if not bad:
+            return True, []
+    return False, bad
+
+
+def hypr_append_target(rules, files):
+    """Where a rule for an output that has none goes: next to the other named rules."""
+    for r in reversed(rules):
+        if hypr_rule_kind(r) == "mode" and r["fields"][0]:
+            return r["path"]
+    for r in reversed(rules):
+        return r["path"]
+    return files[0] if files else HYPR_CONF
+
+
+def hypr_render(states, targets, positions, files=None):
+    """{path: new text} for every config file whose monitor rules change."""
+    files = files if files is not None else hypr_config_files()
+    rules = hypr_rules(files)
+    edits, appends = {}, []
+    for i, s in enumerate(states):
+        mode_id, _w, _h, scale = targets[i]
+        own = hypr_own_rules(rules, s)
+        for r in own:
+            line = r["prefix"] + hypr_rule_value(r["fields"][0], mode_id, positions[i], scale,
+                                                 r["fields"][4:]) + r["trail"] + r["comment"]
+            edits.setdefault(r["path"], {})[r["line"]] = line
+        if not own:
+            desc = s.get("description", "")
+            sel = f"desc:{desc}" if desc and "," not in desc and "#" not in desc else s["name"]
+            extras = ["transform", str(s["transform"])] if s["transform"] else []
+            appends.append("monitor = " + hypr_rule_value(sel, mode_id, positions[i], scale,
+                                                          extras))
+    out = {}
+    target = hypr_append_target(rules, files)
+    for path in set(edits) | ({target} if appends else set()):
+        try:
+            with open(path) as fh:
+                text = fh.read()
+        except FileNotFoundError:
+            text = ""
+        lines = text.splitlines()
+        for n, line in edits.get(path, {}).items():
+            lines[n] = line
+        if path == target and appends:
+            lines += ["", "# added by native-hidpi"] + appends
+        new = "\n".join(lines) + "\n"
+        if new != text:
+            out[path] = new
+    return out
+
+
+def hypr_write(rendered):
+    """Back up each file once, write atomically. Returns (error or None, paths written)."""
+    written = []
+    for path, text in rendered.items():
+        backup = path + HYPR_BACKUP_SUFFIX
+        try:
+            if os.path.exists(path) and not os.path.exists(backup):
+                shutil.copy2(path, backup)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(text)
+            os.replace(tmp, path)
+            written.append(path)
+        except OSError as exc:
+            return f"could not write {path}: {exc}", written
+    return None, written
+
+
+def hypr_env_render(text, name, value):
+    """hyprland.conf with `env = name,value` set: existing lines for it rewritten, else one
+    added after the last `env =` line (or at the end)."""
+    lines = text.splitlines()
+    own = re.compile(rf"^\s*env\s*=\s*{re.escape(name)}\s*,")
+    new = f"env = {name},{value}"
+    hits = [i for i, line in enumerate(lines) if own.match(hypr_strip_comment(line)[0])]
+    if hits:
+        for i in hits:
+            lines[i] = new
+    else:
+        envs = [i for i, line in enumerate(lines)
+                if re.match(r"^\s*env\s*=", hypr_strip_comment(line)[0])]
+        at = envs[-1] + 1 if envs else len(lines)
+        lines[at:at] = ["# added by native-hidpi: FreeType stem darkening (macOS-like strokes)",
+                        new]
+    return "\n".join(lines) + "\n"
+
+
+def hypr_drift(states, files=None, hypr_dir=None):
+    """The ways a Hyprland config undoes a live change on the next reload or hotplug."""
+    files = files if files is not None else hypr_config_files()
+    hypr_dir = hypr_dir or HYPR_DIR
+    rules = hypr_rules(files)
+    notes = []
+    for s in states:
+        c = s["current"]
+        own = hypr_own_rules(rules, s)
+        if not own:
+            fallback = [r for r in rules if hypr_rule_kind(r) == "mode" and not r["fields"][0]]
+            if not fallback:
+                notes.append(f"{s['name']}: no monitor rule at all - Hyprland picks mode and "
+                             "scale itself on every reload or hotplug")
+            elif fallback[-1]["fields"][3].lower() == "auto" or \
+                    fallback[-1]["fields"][1].lower() in ("preferred", "highres", "highrr"):
+                notes.append(f"{s['name']}: only the catch-all `monitor = "
+                             f"{','.join(fallback[-1]['fields'])}` covers it, so Hyprland "
+                             f"picks the scale itself on every reload or hotplug (running "
+                             f"{format_scale(s['scale'])} now)")
+            continue
+        r = own[-1]
+        f = r["fields"]
+        res = hypr_parse_mode(f[1])
+        try:
+            stored_scale = hypr_snap(float(f[3]))
+        except ValueError:
+            stored_scale = None
+        if (res and (res[0], res[1]) != (c[1], c[2])) or \
+                (stored_scale is not None and abs(stored_scale - s["scale"]) > HYPR_SCALE_TOL):
+            notes.append(f"{s['name']}: running {c[1]}x{c[2]} scale {format_scale(s['scale'])} "
+                         f"but {r['path']}:{r['line'] + 1} stores {f[1]} scale {f[3]} - the "
+                         "next reload or hotplug will switch it back")
+    sourced = {os.path.realpath(p) for p in files}
+    for path in sorted(glob.glob(os.path.join(hypr_dir, "*.conf"))):
+        if os.path.realpath(path) in sourced:
+            continue
+        theirs = [r for r in hypr_rules([path]) if hypr_rule_kind(r) == "mode"]
+        hit = [s["name"] for s in states if any(hypr_rule_matches(r, s) for r in theirs)]
+        if hit:
+            notes.append(f"{path} has monitor rules for {', '.join(hit)} but nothing sources "
+                         f"it from {files[0] if files else HYPR_CONF}, so they have no effect")
+    return notes
+
+
+# What a launcher-started app (systemd --user / D-Bus activation, not a child of Hyprland)
+# needs to see to come up as a native Wayland client instead of on XWayland.
+LAUNCHER_ENV = {"XDG_SESSION_TYPE": "wayland", "ELECTRON_OZONE_PLATFORM_HINT": None}
+
+
+def hypr_stretched_x11(clients, states, zero_scaling):
+    """[(class, monitor, scale)] for XWayland windows on a scaled output. Hyprland draws an
+    X11 client at 1x and stretches it by the scale unless force_zero_scaling is on, so its
+    text is resampled - the soft text people blame on fonts."""
+    if zero_scaling:
+        return []
+    by_id = {s.get("id"): s for s in states}
+    seen, out = set(), []
+    for c in clients:
+        mon = by_id.get(c.get("monitor"))
+        if not c.get("xwayland") or mon is None or float(mon["scale"]) == 1.0:
+            continue
+        key = (c.get("class") or c.get("initialClass") or "?", mon["name"])
+        if key not in seen:
+            seen.add(key)
+            out.append((key[0], mon["name"], mon["scale"]))
+    return out
+
+
+def launcher_env_gaps(env_text):
+    """Names from LAUNCHER_ENV that `systemctl --user show-environment` lacks or has wrong."""
+    have = {}
+    for line in env_text.splitlines():
+        k, _, v = line.partition("=")
+        have[k] = v
+    return [k for k, want in LAUNCHER_ENV.items()
+            if k not in have or (want is not None and have[k] != want)]
+
+
+def x11_advice(stretched, gaps):
+    apps = ", ".join(f"{cls} on {mon} (scale {format_scale(sc)})" for cls, mon, sc in stretched)
+    msg = (f"{apps} run under XWayland: Hyprland draws them at 1x and stretches them, so their "
+           "text is resampled and no font or scale setting makes it crisp.")
+    if gaps:
+        msg += (f" The systemd user environment, which is all that apps started from a "
+                f"launcher see, lacks {', '.join(gaps)}; export them at login, e.g. "
+                f"`exec-once = dbus-update-activation-environment --systemd "
+                f"{' '.join(LAUNCHER_ENV)} ...`, then restart those apps.")
+    else:
+        msg += (" The systemd user environment has the Wayland hints now, so restarting them "
+                "should bring them up native.")
+    if any("chrome" in cls.lower() or "chromium" in cls.lower() for cls, _m, _s in stretched):
+        msg += " Chrome also needs chrome://flags/#ozone-platform-hint set to Wayland or Auto."
+    return msg
+
+
+def hypr_x11_warnings(states):
+    try:
+        clients = json.loads(hyprctl("-j", "clients"))
+        zero = re.search(r"int:\s*1", hyprctl("getoption", "xwayland:force_zero_scaling"))
+    except (RuntimeError, json.JSONDecodeError):
+        return []
+    stretched = hypr_stretched_x11(clients, states, bool(zero))
+    if not stretched:
+        return []
+    env = subprocess.run(["systemctl", "--user", "show-environment"], check=False,
+                         capture_output=True, text=True).stdout if shutil.which("systemctl") else ""
+    return [x11_advice(stretched, launcher_env_gaps(env))]
+
+
+# ---------------------------------------------------------------------------------------
+# Backends: what status / fix / revert need from a compositor.
+# ---------------------------------------------------------------------------------------
+
+class MutterBackend:
+    name = "mutter"
+    label = "GNOME"
+    state_key = "display"  # kept as-is so state.json from older versions still reverts
+    own_keys = ("display", "monitors_xml_existed")
+    errors = MUTTER_ERRORS
+    escape = "Settings -> Displays"
+
+    def available(self):
+        if have_display_config():
+            return None
+        return (f"org.gnome.Mutter.DisplayConfig is not available (session type: "
+                f"{session_type()}"
+                + ("" if HAVE_GI else "; python3-gi is not installed: sudo apt install python3-gi")
+                + "). This tool needs a GNOME session running Mutter, or Hyprland.")
+
+    def read(self):
+        return read_state()[1]
+
+    def drift(self, states):
+        return stored_vs_running(states)
+
+    def extra_notes(self, states):
+        return []
+
+    def warnings(self, states):
+        return []
+
+    def session_env(self, name, value, persist=True):
+        """GNOME's session reads the systemd user environment, so environment.d is enough."""
+
+    def preview(self, states, changes):
+        return [f"would persist to {MONITORS_XML} (backup {MONITORS_XML_BACKUP})"]
+
+    def apply(self, states, changes):
+        apply_changes(states, changes)
+        return verify_applied(changes)
+
+    def rollback(self, states):
+        baseline = {i: (s["current"][0], s["scale"]) for i, s in enumerate(states) if s["current"]}
+        apply_changes(states, baseline)
+        return verify_applied(baseline)[0]
+
+    def record(self, s):
+        return {}
+
+    def persist(self, states, changes):
+        existed = os.path.exists(MONITORS_XML)
+        err = persist_monitors_xml(states, changes)
+        if err:
+            return err
+        prev = load_state()
+        if "monitors_xml_existed" not in prev:
+            prev["monitors_xml_existed"] = existed
+            save_state(prev)
+        print(f"persisted to {MONITORS_XML} (backup at {MONITORS_XML_BACKUP})")
+        return None
+
+    def restore_display(self, states, changes, saved_by_index):
+        apply_changes(states, changes)
+        return verify_applied(changes)
+
+    def restore_config(self, prev, failed):
+        if os.path.exists(MONITORS_XML_BACKUP):
+            try:
+                shutil.copy2(MONITORS_XML_BACKUP, MONITORS_XML)
+                os.remove(MONITORS_XML_BACKUP)
+                print(f"restored {MONITORS_XML} from {MONITORS_XML_BACKUP}")
+            except OSError as exc:
+                failed.append("monitors.xml")
+                print(f"could not restore {MONITORS_XML}: {exc}")
+        elif not prev.get("monitors_xml_existed", True) and os.path.exists(MONITORS_XML):
+            try:
+                os.remove(MONITORS_XML)
+                print(f"removed {MONITORS_XML} (there was none before)")
+            except OSError as exc:
+                failed.append("monitors.xml")
+                print(f"could not remove {MONITORS_XML}: {exc}")
+
+
+class HyprlandBackend:
+    name = "hyprland"
+    label = "Hyprland"
+    state_key = "hypr_display"
+    own_keys = ("hypr_display", "hypr_files")
+    errors = (RuntimeError,)
+    escape = "fix the monitor= lines in your Hyprland config and run `hyprctl reload`"
+
+    def __init__(self):
+        self.positions = None
+
+    def available(self):
+        try:
+            hyprctl("-j", "monitors")
+            return None
+        except RuntimeError as exc:
+            return f"Hyprland is running but hyprctl cannot reach it: {exc}"
+
+    def read(self):
+        return hypr_read_state()[1]
+
+    def drift(self, states):
+        return hypr_drift(states)
+
+    def extra_notes(self, states):
+        return list(HYPR_SKIPPED)
+
+    def warnings(self, states):
+        return hypr_x11_warnings(states)
+
+    def session_env(self, name, value, persist=True):
+        """Apps Hyprland starts itself (keybinds, exec) inherit Hyprland's environment, not
+        systemd's: set it live with `keyword env` and keep it with an `env =` line."""
+        if persist and value:
+            try:
+                with open(HYPR_CONF) as fh:
+                    text = fh.read()
+            except OSError as exc:
+                return f"could not read {HYPR_CONF}: {exc}"
+            new = hypr_env_render(text, name, value)
+            if new != text:
+                err, written = hypr_write({HYPR_CONF: new})
+                prev = load_state()
+                recorded = prev.setdefault("hypr_files", [])
+                for path in written:
+                    if path not in recorded:
+                        recorded.append(path)
+                save_state(prev)
+                if err:
+                    return err
+                print(f"set `env = {name},...` in {HYPR_CONF} "
+                      f"(backup at {HYPR_CONF + HYPR_BACKUP_SUFFIX})")
+        try:
+            hyprctl("keyword", "env", f"{name},{value or ''}")
+        except RuntimeError as exc:
+            return f"`hyprctl keyword env` failed: {exc}"
+        return None
+
+    def preview(self, states, changes):
+        targets, positions, todo = hypr_targets(states, changes)
+        lines = ["would run: hyprctl " + c
+                 for c in hypr_commands(states, targets, positions, todo,
+                                        hypr_rules(hypr_config_files()))]
+        for path in hypr_render(states, targets, positions):
+            lines.append(f"would rewrite monitor rules in {path} "
+                         f"(backup {path + HYPR_BACKUP_SUFFIX})")
+        return lines
+
+    def _send(self, states, changes, positions=None):
+        _serial, fresh = hypr_read_state()
+        if sorted(s["name"] for s in fresh) != sorted(s["name"] for s in states):
+            raise RuntimeError("output set changed (hotplug?); nothing applied, re-run")
+        targets, positions, todo = hypr_targets(states, changes, positions)
+        cmds = hypr_commands(states, targets, positions, todo, hypr_rules(hypr_config_files()))
+        if cmds:
+            out = hyprctl("--batch", " ; ".join(cmds))
+            replies = [l.strip() for l in out.splitlines() if l.strip()]
+            if any(r != "ok" for r in replies):
+                raise RuntimeError("hyprctl: " + "; ".join(replies))
+        want = {}
+        for i in todo:
+            mode_id, w, h, scale = targets[i]
+            want[states[i]["name"]] = (w, h, hypr_parse_mode(mode_id)[2], scale, positions[i])
+        return targets, positions, want
+
+    def apply(self, states, changes):
+        _t, self.positions, want = self._send(states, changes)
+        return hypr_verify(want)
+
+    def rollback(self, states):
+        original = {i: (s["x"], s["y"]) for i, s in enumerate(states)}
+        # every output back to the mode, scale and position it had before
+        baseline = {i: (s["current"][0], s["scale"]) for i, s in enumerate(states)}
+        _t, _p, want = self._send(states, baseline, original)
+        return hypr_verify(want)[0]
+
+    def record(self, s):
+        return {"x": s["x"], "y": s["y"]}
+
+    def persist(self, states, changes):
+        targets, positions, _todo = hypr_targets(states, changes, self.positions)
+        files = hypr_config_files()
+        if not files:
+            return f"{HYPR_CONF} does not exist; nothing to persist to"
+        rendered = hypr_render(states, targets, positions, files)
+        if not rendered:
+            print("monitor rules in the Hyprland config already match")
+            return None
+        err, written = hypr_write(rendered)
+        prev = load_state()
+        recorded = prev.setdefault("hypr_files", [])
+        for p in written:
+            if p not in recorded:
+                recorded.append(p)
+        save_state(prev)
+        if err:
+            return err
+        for p in written:
+            print(f"persisted monitor rules to {p} (backup at {p + HYPR_BACKUP_SUFFIX})")
+        # the file is now the truth; make Hyprland read it (autoreload may be off), and
+        # check that what it reads back is what was asked for
+        try:
+            hyprctl("reload")
+            time.sleep(0.5)
+            errors = hyprctl("configerrors").strip()
+            if errors:
+                return f"Hyprland reports config errors after the reload:\n{errors}"
+        except RuntimeError as exc:
+            return f"rules written but `hyprctl reload` failed: {exc}"
+        want = {states[i]["name"]: (t[1], t[2], hypr_parse_mode(t[0])[2], t[3], positions[i])
+                for i, t in targets.items()}
+        ok, bad = hypr_verify(want)
+        if not ok:
+            return ("rules written, but after `hyprctl reload` Hyprland runs something "
+                    "else - another rule is overriding them:\n  " + "\n  ".join(bad))
+        print("reloaded Hyprland from the config and read it back: matches")
+        return None
+
+    def restore_display(self, states, changes, saved_by_index):
+        positions = {i: (saved_by_index[i].get("x", s["x"]), saved_by_index[i].get("y", s["y"]))
+                     if i in saved_by_index else (s["x"], s["y"])
+                     for i, s in enumerate(states)}
+        _t, _p, want = self._send(states, changes, positions)
+        return hypr_verify(want)
+
+    def restore_config(self, prev, failed):
+        for path in prev.get("hypr_files", []):
+            backup = path + HYPR_BACKUP_SUFFIX
+            if not os.path.exists(backup):
+                continue
+            try:
+                shutil.copy2(backup, path)
+                os.remove(backup)
+                print(f"restored {path} from {backup}")
+            except OSError as exc:
+                failed.append("hyprland config")
+                print(f"could not restore {path}: {exc}")
+        if prev.get("hypr_files") and is_hyprland():
+            try:
+                hyprctl("reload")
+            except RuntimeError as exc:
+                print(f"note: `hyprctl reload` failed ({exc}); reload Hyprland yourself")
+
+
+def get_backend(name=None):
+    name = name or ("hyprland" if is_hyprland() else "mutter")
+    return HyprlandBackend() if name == "hyprland" else MutterBackend()
+
+
 def need_display():
-    if not have_display_config():
-        sys.exit(
-            f"org.gnome.Mutter.DisplayConfig is not available (session type: "
-            f"{session_type()}). This tool needs a GNOME session running Mutter."
-        )
+    backend = get_backend()
+    problem = backend.available()
+    if problem:
+        sys.exit(problem)
+    return backend
 
 
 def cmd_status(_args):
-    need_display()
-    _serial, states = read_state()
+    backend = need_display()
+    states = backend.read()
     if not states:
         sys.exit(
-            "no logical monitors reported by Mutter - no display connected, or the "
+            f"no monitors reported by {backend.name} - no display connected, or the "
             "session is headless. Re-run with a monitor attached."
         )
+    print(f"compositor: {backend.name}")
     problems = report(states)
+    stretched = backend.warnings(states)
+    for warning in stretched:
+        print("\nWARNING  " + warning)
+    for note in backend.extra_notes(states):
+        print("\nNOTE     " + note)
     text_scale = gsettings_float("text-scaling-factor")
     font = gsettings_get("font-name")
     if font is not None:
@@ -653,6 +1491,12 @@ def cmd_status(_args):
             print(f"\nUI font  {font.strip()}  (no size set)")
         print(f"antialiasing {gsettings_get('font-antialiasing')}   "
               f"hinting {gsettings_get('font-hinting')}")
+    ft = systemd_env_get(FT_VAR)
+    if ft is None:
+        ft = os.environ.get(FT_VAR)
+    print(f"stem darkening {'on' if ft_darkened(ft) else 'off'}"
+          + (f"   ({FT_VAR}={ft})" if ft else "")
+          + ("" if ft_darkened(ft) else "   - `fix` (mac profile) turns it on"))
     broken = 0
     if os.path.exists(FONTCONF):
         ok, err = fontconf_ok(FONTCONF)
@@ -664,11 +1508,13 @@ def cmd_status(_args):
                   "entirely: Chrome, Electron and Java clients are silently back on "
                   "distro defaults.")
             print(f"  {err}")
-    for note in stored_vs_running(states):
+    for note in backend.drift(states):
         print("\nNOTE     " + note)
     print("\n" + ("no non-native resolution detected" if problems == 0 else
                   f"{problems} monitor(s) not running at native resolution"))
-    return 0 if (problems == 0 and broken == 0) else 1
+    if stretched:
+        print("some windows are stretched XWayland clients - see the WARNING above")
+    return 0 if (problems == 0 and broken == 0 and not stretched) else 1
 
 
 def plan_fix(states, forced_scale, want_logical_width):
@@ -694,18 +1540,22 @@ def plan_fix(states, forced_scale, want_logical_width):
 
 
 def cmd_fix(args):
-    need_display()
-    _serial, states = read_state()
+    backend = need_display()
+    states = backend.read()
     if not states:
         sys.exit(
-            "no logical monitors reported by Mutter - no display connected, or the "
+            f"no monitors reported by {backend.name} - no display connected, or the "
             "session is headless. Re-run with a monitor attached."
         )
+    if args.no_display and args.no_fonts:
+        sys.exit("--no-display and --no-fonts together leave nothing to do")
     try:
         changes, skipped = plan_fix(states, args.scale, args.want_logical_width)
     except ValueError as exc:
         sys.exit(str(exc))
-    drift = stored_vs_running(states)
+    drift = backend.drift(states)
+    if args.no_display:
+        changes, skipped, drift = {}, [], []
 
     # text-scaling-factor is only ever set when it is asked for. --scale never borrows it:
     # shrinking the text does not shrink the desktop, so a scale the mode cannot do stays
@@ -718,7 +1568,9 @@ def cmd_fix(args):
     cur_text = gsettings_float("text-scaling-factor")
     stale = abs(cur_text - 1.0) > 1e-4
 
-    if not changes:
+    if args.no_display:
+        print("display left as it is (--no-display)")
+    elif not changes:
         print("every output is already at native resolution with the chosen scale")
         if skipped:
             print(f"  (no native mode reported for: {', '.join(skipped)} - left alone)")
@@ -733,45 +1585,44 @@ def cmd_fix(args):
 
     if args.dry_run:
         if changes or drift:
-            print(f"would persist to {MONITORS_XML} (backup {MONITORS_XML_BACKUP})")
+            for line in backend.preview(states, changes):
+                print(line)
         if args.text_scale is not None or stale:
             print(f"would set text-scaling-factor={target_text_scale:g}"
                   + (f" (was {cur_text:g})" if args.text_scale is None and stale else ""))
         if not args.no_fonts:
             rgba, hintstyle, _ga, _gh = PROFILES[args.profile]
             print(f"would write {FONTCONF} (rgba={rgba}, hintstyle={hintstyle})")
+            if args.profile in DARKEN_PROFILES:
+                print(f"would turn on FreeType stem darkening: {ENVD_FILE}, the running "
+                      "session" + (f", and `env =` in {HYPR_CONF}"
+                                   if backend.name == "hyprland" else ""))
         return 0
 
     if changes:
         prev = load_state()
-        if "display" not in prev:
-            prev["display"] = [
-                {"connectors": s["connectors"], "specs": s.get("specs", []),
-                 "mode": s["current"][0], "scale": s["scale"]}
+        if backend.state_key not in prev:
+            prev[backend.state_key] = [
+                dict({"connectors": s["connectors"], "specs": s.get("specs", []),
+                      "mode": s["current"][0], "scale": s["scale"]}, **backend.record(s))
                 for s in states if s["current"]
             ]
             save_state(prev)
         try:
-            apply_changes(states, changes)
-        except (GLib.Error, RuntimeError) as exc:
+            ok, bad = backend.apply(states, changes)
+        except backend.errors as exc:
             sys.exit(f"apply failed, nothing changed: {exc}")
-        ok, bad = verify_applied(changes)
         if not ok:
-            baseline = {
-                i: (s["current"][0], s["scale"])
-                for i, s in enumerate(states) if s["current"]
-            }
             rolled = False
             try:
-                apply_changes(states, baseline)
-                rolled, _ = verify_applied(baseline)
-            except (GLib.Error, RuntimeError) as exc:
+                rolled = backend.rollback(states)
+            except backend.errors as exc:
                 print(f"rollback failed too: {exc}")
             for line in bad:
                 print("  " + line)
             sys.exit("the requested configuration did not take effect; "
                      + ("rolled back to the previous one." if rolled else
-                        "ROLL IT BACK YOURSELF: Settings -> Displays"))
+                        f"ROLL IT BACK YOURSELF: {backend.escape}"))
         for i, (mode_id, scale) in changes.items():
             print(f"applied {','.join(states[i]['connectors'])}: {mode_id} scale {scale} "
                   "(read back and confirmed)")
@@ -779,20 +1630,13 @@ def cmd_fix(args):
     # nothing to apply live, but the stored file still disagrees with what is running,
     # and that is what a hotplug or the next login would restore.
     if changes or drift:
-        existed = os.path.exists(MONITORS_XML)
-        err = persist_monitors_xml(states, changes)
+        err = backend.persist(states, changes)
         if err:
             print(f"WARNING  {err}")
             print("  " + ("the live change is in effect, but the next hotplug or login "
                           "will undo it" if changes else
-                          "nothing live needed changing, but the stored file is what the "
+                          "nothing live needed changing, but the stored config is what the "
                           "next hotplug or login will restore"))
-        else:
-            prev = load_state()
-            if "monitors_xml_existed" not in prev:
-                prev["monitors_xml_existed"] = existed
-                save_state(prev)
-            print(f"persisted to {MONITORS_XML} (backup at {MONITORS_XML_BACKUP})")
 
     if args.text_scale is not None or abs(target_text_scale - cur_text) > 1e-4:
         prev = load_state()
@@ -826,9 +1670,48 @@ def cmd_fix(args):
         gsettings_op("set", "font-antialiasing", gnome_aa)
         gsettings_op("set", "font-hinting", gnome_hint)
         print(f"wrote {FONTCONF} and set antialiasing={gnome_aa}, hinting={gnome_hint}")
-        print("profiles: mac (grayscale+slight), sharp (grayscale+full), subpixel (rgb+slight)")
-        print("restart browsers - they read fontconfig once at startup")
+        set_stem_darkening(backend, args.profile in DARKEN_PROFILES)
+        print("profiles: mac (grayscale+slight+stem darkening), sharp (grayscale+full), "
+              "subpixel (rgb+slight)")
+        print("restart browsers and apps - they read fontconfig and FreeType settings once "
+              "at startup")
     return 0
+
+
+def set_stem_darkening(backend, on):
+    """Switch FreeType stem darkening on (mac profile) or take our keys back out."""
+    current = systemd_env_get(FT_VAR)
+    if current is None:
+        current = os.environ.get(FT_VAR, "")
+    if not on and not ft_darkened(current) and not os.path.exists(ENVD_FILE):
+        return
+    prev = load_state()
+    if "freetype" not in prev:
+        envd = None
+        if os.path.exists(ENVD_FILE):
+            with open(ENVD_FILE) as fh:
+                envd = fh.read()
+        prev["freetype"] = {"envd": envd, "session": systemd_env_get(FT_VAR)}
+        save_state(prev)
+    value = ft_merge(current, on)
+    try:
+        if value:
+            write_text_atomic(ENVD_FILE, envd_body(value))
+        elif os.path.exists(ENVD_FILE):
+            os.remove(ENVD_FILE)
+    except OSError as exc:
+        print(f"WARNING  could not write {ENVD_FILE}: {exc}")
+    if not session_env_set(FT_VAR, value or None):
+        print("WARNING  systemctl --user refused the environment change; it applies from "
+              "the next login")
+    err = backend.session_env(FT_VAR, value)
+    if err:
+        print(f"WARNING  {err}")
+    if on:
+        print(f"turned on FreeType stem darkening: {FT_VAR}=\"{value}\" in {ENVD_FILE} "
+              "and the running session")
+    else:
+        print("turned FreeType stem darkening off again (not part of this profile)")
 
 
 def cmd_revert(_args):
@@ -838,15 +1721,25 @@ def cmd_revert(_args):
         return 1
     failed = []
 
-    if prev.get("display"):
-        if not have_display_config():
+    # state.json can hold records from both compositors (the same machine run under GNOME
+    # and under Hyprland); revert the one this session runs, keep the other's for later.
+    backend = get_backend()
+    other = get_backend("mutter" if backend.name == "hyprland" else "hyprland")
+    # Hyprland: the restored files are what a reload applies, so put them back first and
+    # then restore the recorded live state on top; Mutter: display first, then the file.
+    if backend.name == "hyprland":
+        backend.restore_config(prev, failed)
+
+    if prev.get(backend.state_key):
+        problem = backend.available()
+        if problem:
             failed.append("display")
-            print("cannot restore the display configuration: Mutter's DisplayConfig is not "
-                  "available in this session; Settings -> Displays is the way back")
+            print(f"cannot restore the display configuration: {problem}; "
+                  f"{backend.escape} is the way back")
         else:
-            _serial, states = read_state()
-            changes = {}
-            for saved in prev["display"]:
+            states = backend.read()
+            changes, saved_by_index = {}, {}
+            for saved in prev[backend.state_key]:
                 want_specs = saved.get("specs")
                 for i, s in enumerate(states):
                     here = [tuple(c) for c in s.get("specs", [])]
@@ -856,6 +1749,7 @@ def cmd_revert(_args):
                         matched = sorted(s["connectors"]) == sorted(saved["connectors"])
                     if matched:
                         changes[i] = (saved["mode"], saved["scale"])
+                        saved_by_index[i] = saved
             if len(changes) != len(states):
                 print("note: the connected output set no longer matches what was recorded; "
                       "restoring only the outputs that are present")
@@ -866,8 +1760,7 @@ def cmd_revert(_args):
                       f"{STATE_FILE} in place")
             else:
                 try:
-                    apply_changes(states, changes)
-                    ok, bad = verify_applied(changes)
+                    ok, bad = backend.restore_display(states, changes, saved_by_index)
                     if not ok:
                         failed.append("display")
                         print("the restored display configuration did not read back:")
@@ -877,25 +1770,33 @@ def cmd_revert(_args):
                         print("restored " + ", ".join(
                             f"{','.join(s['connectors'])}={changes[i][0]}@{changes[i][1]}"
                             for i, s in enumerate(states) if i in changes))
-                except (GLib.Error, RuntimeError) as exc:
+                except backend.errors as exc:
                     failed.append("display")
                     print(f"could not restore the display configuration: {exc}")
 
-    if os.path.exists(MONITORS_XML_BACKUP):
+    if backend.name != "hyprland":
+        backend.restore_config(prev, failed)
+
+    if "freetype" in prev:
+        ft = prev["freetype"]
         try:
-            shutil.copy2(MONITORS_XML_BACKUP, MONITORS_XML)
-            os.remove(MONITORS_XML_BACKUP)
-            print(f"restored {MONITORS_XML} from {MONITORS_XML_BACKUP}")
+            if ft.get("envd") is None:
+                if os.path.exists(ENVD_FILE):
+                    os.remove(ENVD_FILE)
+                    print(f"removed {ENVD_FILE}")
+            else:
+                write_text_atomic(ENVD_FILE, ft["envd"])
+                print(f"restored {ENVD_FILE}")
         except OSError as exc:
-            failed.append("monitors.xml")
-            print(f"could not restore {MONITORS_XML}: {exc}")
-    elif not prev.get("monitors_xml_existed", True) and os.path.exists(MONITORS_XML):
-        try:
-            os.remove(MONITORS_XML)
-            print(f"removed {MONITORS_XML} (there was none before)")
-        except OSError as exc:
-            failed.append("monitors.xml")
-            print(f"could not remove {MONITORS_XML}: {exc}")
+            failed.append("environment.d")
+            print(f"could not restore {ENVD_FILE}: {exc}")
+        if not session_env_set(FT_VAR, ft.get("session")):
+            failed.append("session environment")
+        # hyprland.conf itself came back with the other config files above
+        err = backend.session_env(FT_VAR, ft.get("session") or "", persist=False) \
+            if backend.name == "hyprland" and is_hyprland() else None
+        if err:
+            print(f"note: {err}")
 
     if prev.get("interface"):
         for key, value in prev["interface"].items():
@@ -927,10 +1828,16 @@ def cmd_revert(_args):
         print(f"\nnot reverted: {', '.join(sorted(set(failed)))}. Keeping {STATE_FILE} "
               "so you can try again.")
         return 1
-    try:
-        os.remove(STATE_FILE)
-    except OSError:
-        pass
+    left = {k: prev[k] for k in other.own_keys if k in prev}
+    if left:
+        save_state(left)
+        print(f"kept the {other.label} display record in {STATE_FILE}; run `revert` in a "
+              f"{other.label} session to restore that one")
+    else:
+        try:
+            os.remove(STATE_FILE)
+        except OSError:
+            pass
     print("reverted; restart browsers")
     return 0
 
@@ -1174,6 +2081,205 @@ def cmd_selftest(_args):
     except ValueError as exc:
         r["no_integer_step_rejected"] = "2.7" in str(exc) and str(FRAC) in str(exc)
 
+    # Hyprland: hyprctl JSON in, monitor= rules out, against scratch config files
+    def hmon(name, desc, serial, x, scale, modes, w=3840, h=2160, rate=59.997, **kw):
+        return dict({"name": name, "description": desc, "serial": serial, "width": w,
+                     "height": h, "refreshRate": rate, "x": x, "y": 0, "scale": scale,
+                     "transform": 0, "focused": False, "disabled": False, "mirrorOf": "none",
+                     "availableModes": modes}, **kw)
+    MODES_27 = ["3840x2160@60.00Hz", "3840x2160@29.56Hz", "2560x1440@59.95Hz"]
+    MODES_32 = ["3840x2160@60.00Hz", "3840x2160@119.88Hz", "3840x2160@120.00Hz",
+                "2560x1440@120.00Hz"]
+    hj = [hmon("DP-2", "Dell Inc. DELL U2720Q AB12345", "AB12345", 0, 1.5, MODES_27),
+          hmon("DP-3", "Dell Inc. DELL U3225QE CD67890", "CD67890", 2560, 1.5, MODES_32),
+          hmon("HDMI-A-1", "Mirror", "", 0, 1.0, MODES_27, mirrorOf="DP-2"),
+          hmon("DP-9", "Off", "", 0, 1.0, MODES_27, disabled=True)]
+    hstates, hskipped = hypr_states_from_json(hj)
+    hstates_2x = [dict(hstates[0], scale=2.0), dict(hstates[1], scale=2.0, x=1920)]
+    xstates = [dict(hstates[0], id=0), dict(hstates[1], id=1, scale=1.2)]
+    xclients = [{"class": "foot", "xwayland": False, "monitor": 1},
+                {"class": "com.anthropic.Claude", "xwayland": True, "monitor": 0},
+                {"class": "Google-chrome", "xwayland": True, "monitor": 1}]
+    blurry = hypr_states_from_json([hmon("DP-1", "Dell Inc. DELL U2720Q X", "X", 0, 1.0,
+                                         MODES_27, w=2560, h=1440, rate=59.951)])[0]
+    h4k = hypr_scales(3840, 2160)
+    r["h_layout"], _ = hypr_layout(hstates, {0: (3840, 2160, 2.0), 1: (3840, 2160, 2.0)})
+    overlapping = [dict(hstates[0], x=1920), dict(hstates[1], x=0)]
+    r["h_overlap"], _ = hypr_layout(overlapping, {0: (3840, 2160, 1.5), 1: (3840, 2160, 1.5)})
+    stacked = [dict(hstates[0]), dict(hstates[1], x=0, y=1440)]
+    r["h_stacked"], r["h_stacked_row"] = hypr_layout(
+        stacked, {0: (3840, 2160, 2.0), 1: (3840, 2160, 2.0)})
+    rotated = [dict(hstates[0], transform=1), dict(hstates[1], x=1440)]
+    r["h_rotated"], _ = hypr_layout(rotated, {0: (3840, 2160, 2.0), 1: (3840, 2160, 2.0)})
+    with tempfile.TemporaryDirectory() as td:
+        conf = os.path.join(td, "hyprland.conf")
+        mons = os.path.join(td, "monitors.conf")
+        with open(mons, "w") as fh:
+            fh.write("# Generated by nwg-displays\n\n"
+                     "monitor=DP-3,3840x2160@60.0,0x150,1.5,bitdepth,10  # the 32\n"
+                     "monitor=DP-2,3840x2160@60.0,1920x150,1.5\n")
+        with open(conf, "w") as fh:
+            fh.write("monitor = , preferred, auto, auto\n"
+                     "# source = " + mons + "\n"
+                     "decoration {\n  col = rgba(00000088) ## not a comment\n}\n")
+        files = hypr_config_files(conf)
+        notes = hypr_drift(hstates, files, td)
+        r["h_unsourced_flagged"] = any("monitors.conf" in n and "nothing sources" in n
+                                       for n in notes)
+        r["h_catchall_flagged"] = sum("catch-all" in n for n in notes) == 2
+        with open(conf, "w") as fh:
+            fh.write("monitor = , preferred, auto, auto\nsource = ./monitors.conf\n")
+        files = hypr_config_files(conf)
+        r["h_source_followed"] = [os.path.basename(f) for f in files] == \
+            ["hyprland.conf", "monitors.conf"]
+        notes = hypr_drift(hstates, files, td)
+        r["h_sourced_no_unsourced_note"] = not any("nothing sources" in n for n in notes)
+        r["h_stale_position_ok"] = not any("catch-all" in n for n in notes)
+        changes = plan_fix(hstates, None, 1920)[0]
+        targets, positions, todo = hypr_targets(hstates, changes)
+        r["h_todo"] = sorted(todo) == [0, 1]
+        cmds = hypr_commands(hstates, targets, positions, todo, hypr_rules(files))
+        r["h_cmds"] = cmds
+        rendered = hypr_render(hstates, targets, positions, files)
+        r["h_render_one_file"] = list(rendered) == [mons]
+        err, written = hypr_write(rendered)
+        with open(mons) as fh:
+            txt = fh.read()
+        r["h_written"] = err is None and written == [mons] and \
+            os.path.exists(mons + HYPR_BACKUP_SUFFIX)
+        r["h_extras_and_comment_kept"] = \
+            "monitor=DP-3,3840x2160@59.997,1920x0,2,bitdepth,10  # the 32\n" in txt
+        r["h_prefix_kept"] = "monitor=DP-2,3840x2160@59.997,0x0,2\n" in txt
+        r["h_header_kept"] = txt.startswith("# Generated by nwg-displays\n")
+        applied = [dict(s, scale=2.0, x=positions[i][0]) for i, s in enumerate(hstates)]
+        r["h_no_drift_after_write"] = hypr_drift(applied, files, td) == []
+        r["h_drift_detected"] = any("stores" in n for n in hypr_drift(hstates, files, td))
+        # an output with no rule of its own gets one, by desc: so a reused connector name
+        # cannot pick it up
+        with open(mons, "w") as fh:
+            fh.write("monitor=DP-3,3840x2160@60.0,1920x0,2\n")
+        rendered = hypr_render(applied, targets, positions, files)
+        r["h_appended_by_desc"] = mons in rendered and \
+            "monitor = desc:Dell Inc. DELL U2720Q AB12345,3840x2160@59.997,0x0,2\n" in \
+            rendered[mons]
+        r["h_desc_rule_matches"] = hypr_rule_matches(
+            {"fields": ["desc:Dell Inc. DELL U2720Q"]}, hstates[0]) and not \
+            hypr_rule_matches({"fields": ["desc:Dell Inc. DELL U2720Q"]}, hstates[1])
+    try:
+        plan_fix(hstates, 1.8, 1920)
+        r["h_18_rejected"] = False
+    except ValueError as exc:
+        r["h_18_rejected"] = "whole pixels" in str(exc)
+
+    hypr_checks = [
+        ("hypr: 4K offers 1.5, 5/3 and 2 on the 1/120 grid",
+         1.5 in h4k and 2.0 in h4k and 200 / 120 in h4k),
+        ("hypr: 4K refuses 1.75 and 1.8", 1.75 not in h4k and 1.8 not in h4k),
+        ("hypr: rounded hyprctl scale snaps back onto the grid",
+         hypr_snap(1.67) == 200 / 120 and hypr_snap(1.5) == 1.5 and hypr_snap(2) == 2.0),
+        ("hypr: mode strings parse", hypr_parse_mode("3840x2160@60.00Hz") ==
+         (3840, 2160, 60.0) and hypr_parse_mode("preferred") is None),
+        ("hypr: mirrored and disabled outputs left alone",
+         [s["name"] for s in hstates] == ["DP-2", "DP-3"] and len(hskipped) == 1),
+        ("hypr: native is the largest mode, kernel-preferred refresh",
+         hstates[1]["native"][:3] == ("3840x2160@60", 3840, 2160)),
+        ("hypr: identity carries the serial", hstates[0]["identity"] == (("DP-2", "AB12345"),)),
+        ("hypr: detects a 1440p signal on a 4K panel", len(find_problems(blurry)) == 1),
+        ("hypr: plan picks 2x and keeps the running refresh",
+         plan_fix(hstates, None, 1920)[0] ==
+         {0: ("3840x2160@59.997", 2.0), 1: ("3840x2160@59.997", 2.0)}),
+        ("hypr: plan switches a 1440p signal to native",
+         plan_fix(blurry, None, 1920)[0] == {0: ("3840x2160@60", 2.0)}),
+        ("hypr: plan refuses 1.8", r["h_18_rejected"]),
+        ("hypr: plan snaps --scale 1.67 to 5/3",
+         plan_fix(hstates, 1.67, 1920)[0][0][1] == 200 / 120),
+        ("hypr: --scale 1.5 is taken as is",
+         plan_fix(hstates_2x, 1.5, 1920)[0] ==
+         {0: ("3840x2160@59.997", 1.5), 1: ("3840x2160@59.997", 1.5)}),
+        ("hypr: --scale 1.6 is Hyprland's exact 1.6 step, not 5/3",
+         plan_fix(hstates, 1.6, 1920)[0][0][1] == 1.6),
+        ("hypr: --scale 1.5 from 2x re-packs the row to 2560 wide",
+         hypr_targets(hstates_2x, plan_fix(hstates_2x, 1.5, 1920)[0])[1] ==
+         {0: (0, 0), 1: (2560, 0)}),
+        ("hypr: XWayland window on a scaled output is flagged",
+         hypr_stretched_x11(xclients, xstates, False) ==
+         [("com.anthropic.Claude", "DP-2", 1.5), ("Google-chrome", "DP-3", 1.2)]),
+        ("hypr: native Wayland windows and 1x outputs are not flagged",
+         hypr_stretched_x11([c for c in xclients if c["class"] != "Google-chrome"],
+                            [xstates[0], dict(xstates[1], scale=1.0)], False) ==
+         [("com.anthropic.Claude", "DP-2", 1.5)]),
+        ("hypr: nothing flagged with force_zero_scaling on",
+         hypr_stretched_x11(xclients, xstates, True) == []),
+        ("hypr: one entry per app and monitor", len(hypr_stretched_x11(
+            xclients + [dict(xclients[1], title="second window")], xstates, False)) == 2),
+        ("hypr: launcher env gaps found",
+         launcher_env_gaps("WAYLAND_DISPLAY=wayland-1\nXDG_SESSION_TYPE=tty\n") ==
+         ["XDG_SESSION_TYPE", "ELECTRON_OZONE_PLATFORM_HINT"]),
+        ("hypr: complete launcher env has no gaps", launcher_env_gaps(
+            "XDG_SESSION_TYPE=wayland\nELECTRON_OZONE_PLATFORM_HINT=auto\n") == []),
+        ("hypr: advice names the missing variables and Chrome's flag",
+         "ELECTRON_OZONE_PLATFORM_HINT" in x11_advice(
+             hypr_stretched_x11(xclients, xstates, False), ["ELECTRON_OZONE_PLATFORM_HINT"])
+         and "ozone-platform-hint" in x11_advice(
+             hypr_stretched_x11(xclients, xstates, False), [])),
+        ("stem darkening: both FreeType keys switched on",
+         ft_merge("", True) == "cff:no-stem-darkening=0 autofitter:no-stem-darkening=0"),
+        ("stem darkening: other FreeType properties are kept",
+         ft_merge("truetype:interpreter-version=40 cff:no-stem-darkening=1", True) ==
+         "truetype:interpreter-version=40 cff:no-stem-darkening=0 "
+         "autofitter:no-stem-darkening=0"),
+        ("stem darkening: off drops only our keys",
+         ft_merge("truetype:interpreter-version=40 cff:no-stem-darkening=0 "
+                  "autofitter:no-stem-darkening=0", False) == "truetype:interpreter-version=40"),
+        ("stem darkening: detected on and off",
+         ft_darkened(ft_merge("", True)) and not ft_darkened("") and
+         not ft_darkened(None) and not ft_darkened("cff:no-stem-darkening=0")),
+        ("stem darkening: only the mac profile turns it on", DARKEN_PROFILES == ("mac",)),
+        ("stem darkening: environment.d line is KEY=\"value\"",
+         envd_body("a=0 b=0").splitlines()[-1] == 'FREETYPE_PROPERTIES="a=0 b=0"'),
+        ("hypr env: added after the last env line",
+         hypr_env_render("env = A,1\nenv = B,2\nexec-once = x\n", "FT", "v").splitlines()[2:4]
+         == ["# added by native-hidpi: FreeType stem darkening (macOS-like strokes)",
+             "env = FT,v"]),
+        ("hypr env: existing line rewritten, not duplicated",
+         hypr_env_render("env = FT,old  # mine\nenv = B,2\n", "FT", "v") ==
+         "env = FT,v\nenv = B,2\n"),
+        ("hypr env: appended when there are no env lines",
+         hypr_env_render("monitor = ,preferred,auto,1\n", "FT", "v").endswith("env = FT,v\n")),
+        ("hypr env: a commented-out line is not taken as set",
+         hypr_env_render("# env = FT,old\n", "FT", "v").count("env = FT,v") == 1),
+        ("hypr: --scale already running needs no change",
+         plan_fix(hstates, 1.5, 1920)[0] == {}),
+        ("hypr: side-by-side row re-packed for the new width",
+         r["h_layout"] == {0: (0, 0), 1: (1920, 0)}),
+        ("hypr: overlapping row re-packed in left-to-right order",
+         r["h_overlap"] == {1: (0, 0), 0: (2560, 0)}),
+        ("hypr: stacked outputs keep their positions",
+         not r["h_stacked_row"] and r["h_stacked"] == {0: (0, 0), 1: (0, 1440)}),
+        ("hypr: rotated output packs by its rotated width",
+         r["h_rotated"] == {0: (0, 0), 1: (1080, 0)}),
+        ("hypr: '##' is an escaped #, not a comment",
+         hypr_strip_comment("col = rgba(1) ## x # real") == ("col = rgba(1) ## x ", "# real")),
+        ("hypr: unsourced monitors.conf flagged", r["h_unsourced_flagged"]),
+        ("hypr: catch-all auto rule flagged per output", r["h_catchall_flagged"]),
+        ("hypr: source = followed (relative path)", r["h_source_followed"]),
+        ("hypr: no unsourced note once sourced", r["h_sourced_no_unsourced_note"]),
+        ("hypr: own rule beats the catch-all note", r["h_stale_position_ok"]),
+        ("hypr: both outputs get a rule", r["h_todo"]),
+        ("hypr: live rules carry extras from the user's rule",
+         r["h_cmds"] == ["keyword monitor DP-2,3840x2160@59.997,0x0,2",
+                         "keyword monitor DP-3,3840x2160@59.997,1920x0,2,bitdepth,10"]),
+        ("hypr: only the file holding the rules is rewritten", r["h_render_one_file"]),
+        ("hypr: write backs up and replaces", r["h_written"]),
+        ("hypr: rewrite keeps extras and trailing comment", r["h_extras_and_comment_kept"]),
+        ("hypr: rewrite keeps the line's own spelling", r["h_prefix_kept"]),
+        ("hypr: rewrite keeps the rest of the file", r["h_header_kept"]),
+        ("hypr: stored rule vs running scale drift detected", r["h_drift_detected"]),
+        ("hypr: no drift once written", r["h_no_drift_after_write"]),
+        ("hypr: output without a rule gets one by desc:", r["h_appended_by_desc"]),
+        ("hypr: desc: rules match by description prefix", r["h_desc_rule_matches"]),
+    ]
+
     checks = [
         ("detects upscaled signal", len(find_problems(fake)) == 1),
         ("names the right connector", find_problems(fake)[0].startswith("DP-1")),
@@ -1277,6 +2383,7 @@ def cmd_selftest(_args):
         ("user fonts.conf parses (if present)",
          (not os.path.exists(FONTCONF)) or fontconf_ok(FONTCONF)[0]),
     ]
+    checks += hypr_checks
     failed = 0
     for name, ok in checks:
         print(f"  {'ok  ' if ok else 'FAIL'}  {name}")
@@ -1308,6 +2415,9 @@ def main():
     f.add_argument("--profile", choices=sorted(PROFILES), default="mac",
                    help="antialiasing profile to install (default: mac)")
     f.add_argument("--no-fonts", action="store_true", help="only touch the display config")
+    f.add_argument("--no-display", action="store_true",
+                   help="only touch fonts (fontconfig, GSettings, stem darkening); leave "
+                        "modes, scales and layout as they are")
     f.add_argument("--dry-run", action="store_true", help="print what would change")
 
     sub.add_parser("revert", help="restore the recorded mode, scale, gsettings and fonts.conf")
